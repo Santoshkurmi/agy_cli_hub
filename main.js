@@ -299,18 +299,139 @@ export class AntigravityClient {
           } else {
             history.push({ role: 'tool', toolType: 'command', command: cmd, output: step.runCommand.output || step.runCommand.combinedOutput?.full });
           }
+        } else if (step.viewFile) {
+          const path = step.viewFile.absolutePathUri || 'File';
+          history.push({ role: 'tool', toolType: 'read', command: step.metadata?.toolAction || `Read: ${path}` });
+        } else if (step.find) {
+          history.push({ role: 'tool', toolType: 'find', command: step.metadata?.toolAction || `Find: ${step.find.pattern}` });
+        } else if (step.listDirectory) {
+          history.push({ role: 'tool', toolType: 'list', command: step.metadata?.toolAction || `List: ${step.listDirectory.directoryPathUri}` });
         } else if (step.codeAction) {
           history.push({ role: 'tool', toolType: 'code', uri: step.codeAction.uri });
         } else if (step.searchWeb) {
           history.push({ role: 'tool', toolType: 'search', query: step.searchWeb.query || 'Web Search' });
         } else if (step.generic) {
           history.push({ role: 'tool', toolType: 'generic', action: step.generic.toolAction || step.generic.toolSummary });
+          history.push({ role: 'tool', toolType: 'search', query: step.searchWeb.query || step.metadata?.toolAction || 'Web Search' });
+        } else if (step.generic || step.metadata?.toolAction) {
+          history.push({ role: 'tool', toolType: 'action', action: step.metadata?.toolAction || step.generic?.toolAction || step.generic?.toolSummary || 'Tool Action' });
         } else if (step.errorMessage) {
           history.push({ role: 'error', message: step.errorMessage.error?.userErrorMessage || step.errorMessage.error?.shortError });
         }
       }
     }
     return history;
+  }
+
+  // Get all tasks / commands (completed, error, running) in conversation
+  async getConversationTasks(cascadeId) {
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: encodeGrpcWebFrame({
+        cascade_id: cascadeId,
+        trajectory_verbosity: 2
+      })
+    });
+    if (!res.ok) throw new Error(`GetCascadeTrajectorySteps failed: ${res.status}`);
+
+    const tasks = [];
+    for await (const json of parseGrpcWebStream(res.body)) {
+      const steps = json.steps || [];
+      steps.forEach((step, idx) => {
+        const rawStatus = step.status || '';
+        let status = 'DONE';
+        if (rawStatus.includes('RUNNING')) status = 'RUNNING';
+        else if (rawStatus.includes('ERROR') || rawStatus.includes('FAIL')) status = 'ERROR';
+        else if (rawStatus.includes('CANCEL')) status = 'CANCELLED';
+        else if (rawStatus.includes('WAIT')) status = 'WAITING';
+
+        const actionSummary = step.metadata?.toolAction || step.metadata?.toolSummary;
+
+        if (step.runCommand) {
+          tasks.push({
+            stepIndex: idx,
+            type: 'command',
+            label: step.runCommand.commandLine || step.runCommand.proposedCommandLine || actionSummary || 'Command',
+            output: step.runCommand.combinedOutput?.full || step.runCommand.output || '',
+            status,
+            rawStatus
+          });
+        } else if (step.searchWeb) {
+          tasks.push({
+            stepIndex: idx,
+            type: 'search',
+            label: step.searchWeb.query || actionSummary || 'Web Search',
+            output: step.searchWeb.summary || 'Executed Web Search',
+            status,
+            rawStatus
+          });
+        } else if (step.viewFile) {
+          const path = step.viewFile.absolutePathUri || 'File';
+          const range = step.viewFile.startLine ? `L${step.viewFile.startLine}-${step.viewFile.endLine}` : `${step.viewFile.numLines || ''} lines`;
+          tasks.push({
+            stepIndex: idx,
+            type: 'read',
+            label: actionSummary || `Read: ${path} (${range})`,
+            output: `File: ${path}\nLines: ${range} (${step.viewFile.numBytes || ''} bytes)`,
+            status,
+            rawStatus
+          });
+        } else if (step.find) {
+          tasks.push({
+            stepIndex: idx,
+            type: 'find',
+            label: actionSummary || `Find: ${step.find.pattern} in ${step.find.searchDirectory}`,
+            output: `Directory: ${step.find.searchDirectory}\nPattern: ${step.find.pattern}\nMatches:\n${step.find.truncatedOutput || step.find.totalResults + ' matches found'}`,
+            status,
+            rawStatus
+          });
+        } else if (step.listDirectory) {
+          const dir = step.listDirectory.directoryPathUri || '';
+          const files = (step.listDirectory.results || []).map(r => r.name).join(', ');
+          tasks.push({
+            stepIndex: idx,
+            type: 'list',
+            label: actionSummary || `List: ${dir}`,
+            output: `Directory: ${dir}\nItems (${step.listDirectory.results?.length || 0}):\n${files}`,
+            status,
+            rawStatus
+          });
+        } else if (step.codeAction) {
+          tasks.push({
+            stepIndex: idx,
+            type: 'edit',
+            label: actionSummary || step.codeAction.uri || 'File Edit',
+            output: step.codeAction.diff || step.codeAction.content || 'Code Action Applied',
+            status,
+            rawStatus
+          });
+        } else if (step.generic || actionSummary) {
+          tasks.push({
+            stepIndex: idx,
+            type: 'action',
+            label: actionSummary || step.generic?.toolAction || step.generic?.toolSummary || 'Agent Tool Action',
+            output: JSON.stringify(step.generic?.args || step.metadata?.internalMetadata || {}),
+            status,
+            rawStatus
+          });
+        }
+      });
+    }
+    return tasks;
+  }
+
+  // Cancel / kill a specific step or background task
+  async cancelTask(cascadeId, stepIndex) {
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/CancelCascadeSteps`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: encodeGrpcWebFrame({
+        cascade_id: cascadeId,
+        step_indices: [stepIndex]
+      })
+    });
+    return res.ok;
   }
 
   // Send a prompt with full tool calling & thinking enabled
@@ -532,7 +653,7 @@ class InteractiveApp {
     console.log('\x1b[1;35m║\x1b[0m \x1b[1;37m✦ ANTIGRAVITY DIRECT AI CONSOLE (Google Pro Subscription) ✦\x1b[0m           \x1b[1;35m║\x1b[0m');
     console.log('\x1b[1;35m╚════════════════════════════════════════════════════════════════════════╝\x1b[0m\n');
     this.printStatus();
-    console.log('\x1b[90mCommands: /list (or /chats with fzf), /models (fzf), /new, /quota, /stop, /history, /exit\x1b[0m\n');
+    console.log('\x1b[90mCommands: /list, /tasks (or /ps), /copy, /export, /files, /models, /quota, /help\x1b[0m\n');
   }
 
   printStatus() {
@@ -610,6 +731,9 @@ class InteractiveApp {
         } else if (msg.toolType === 'search') {
           console.log(`\x1b[36m[Web Search: ${msg.query}]\x1b[0m\n`);
         } else if (msg.toolType === 'generic') {
+        } else if (msg.toolType === 'read' || msg.toolType === 'find' || msg.toolType === 'list') {
+          console.log(`\x1b[36m[${msg.command}]\x1b[0m\n`);
+        } else if (msg.toolType === 'action' || msg.toolType === 'generic') {
           console.log(`\x1b[36m[Action: ${msg.action}]\x1b[0m\n`);
         }
       } else if (msg.role === 'error') {
@@ -676,6 +800,167 @@ class InteractiveApp {
     } else {
       console.log(`\x1b[31mModel "${query}" not found. Type \`/models\` to search.\x1b[0m\n`);
     }
+  }
+
+  // Interactive fzf task & process inspector (shows completed, running, errors)
+  async showTasksWithFzf() {
+    if (!this.currentConversationId) {
+      console.log('\x1b[90mNo active conversation.\x1b[0m\n');
+      return;
+    }
+    process.stdout.write('\x1b[90mLoading tasks & command executions...\x1b[0m\r');
+    const tasks = await this.client.getConversationTasks(this.currentConversationId);
+    process.stdout.write('                                       \r');
+
+    if (tasks.length === 0) {
+      console.log('\x1b[90mNo tasks or command executions found in this conversation.\x1b[0m\n');
+      return;
+    }
+
+    const items = tasks.map((t) => {
+      let badge = '\x1b[32m✔ DONE   \x1b[0m';
+      if (t.status === 'RUNNING') badge = '\x1b[1;33m⚙ RUNNING\x1b[0m';
+      else if (t.status === 'ERROR') badge = '\x1b[31m✖ ERROR  \x1b[0m';
+      else if (t.status === 'CANCELLED') badge = '\x1b[90m⊘ CANCEL \x1b[0m';
+      else if (t.status === 'WAITING') badge = '\x1b[35m⏳ WAITING\x1b[0m';
+
+      const typeBadge = `\x1b[36m[${t.type.padEnd(7)}]\x1b[0m`;
+      const stepStr = `\x1b[90m#${String(t.stepIndex).padStart(2)}\x1b[0m`;
+      const preview = t.label.length > 45 ? t.label.slice(0, 42) + '...' : t.label;
+
+      return `${badge} ${stepStr} ${typeBadge} \x1b[1;37m${preview.padEnd(46)}\x1b[0m \x1b[90m[step-${t.stepIndex}]\x1b[0m`;
+    });
+
+    const selected = runFzf(items, 'Select Task / Command to Inspect > ');
+    if (selected) {
+      const match = selected.match(/\[step-(\d+)\]/);
+      if (match) {
+        const stepIdx = parseInt(match[1], 10);
+        const task = tasks.find(t => t.stepIndex === stepIdx);
+        if (task) {
+          console.log(`\n\x1b[1;34m=== Task #${task.stepIndex} Details ===\x1b[0m`);
+          console.log(`\x1b[1;33mType:\x1b[0m   ${task.type}`);
+          console.log(`\x1b[1;33mStatus:\x1b[0m ${task.status} (${task.rawStatus})`);
+          console.log(`\x1b[1;33mAction:\x1b[0m ${task.label}`);
+          if (task.output) {
+            console.log(`\n\x1b[1;32mOutput / Result:\x1b[0m\n${task.output.trim()}\n`);
+          }
+          if (task.status === 'RUNNING') {
+            console.log(`\x1b[33mTo kill this running process, type:\x1b[0m \x1b[1;31m/kill ${task.stepIndex}\x1b[0m\n`);
+          }
+          console.log('\x1b[90m' + '─'.repeat(72) + '\x1b[0m\n');
+        }
+      }
+    } else {
+      this.printHeader();
+    }
+  }
+
+  async killTask(stepIndexStr) {
+    if (!this.currentConversationId) {
+      console.log('\x1b[90mNo active conversation.\x1b[0m\n');
+      return;
+    }
+    const idx = parseInt(stepIndexStr, 10);
+    if (isNaN(idx)) {
+      console.log('\x1b[31mUsage: /kill <step_index> (e.g. /kill 4)\x1b[0m\n');
+      return;
+    }
+    const ok = await this.client.cancelTask(this.currentConversationId, idx);
+    if (ok) {
+      console.log(`\x1b[32m✔ Sent cancel request for task #${idx}.\x1b[0m\n`);
+    } else {
+      console.log(`\x1b[31m✖ Failed to cancel task #${idx}.\x1b[0m\n`);
+    }
+  }
+
+  async copyLastResponse() {
+    if (!this.currentConversationId) {
+      console.log('\x1b[90mNo active conversation.\x1b[0m\n');
+      return;
+    }
+    const history = await this.client.getConversationHistory(this.currentConversationId);
+    const lastAssistant = [...history].reverse().find(m => m.role === 'assistant' && m.content);
+    if (!lastAssistant) {
+      console.log('\x1b[90mNo assistant response to copy.\x1b[0m\n');
+      return;
+    }
+    const text = lastAssistant.content;
+    try {
+      const child = spawn('xsel', ['-b', '-i'], { stdio: ['pipe', 'ignore', 'ignore'] });
+      child.stdin.write(text);
+      child.stdin.end();
+    } catch {}
+    const b64 = Buffer.from(text).toString('base64');
+    process.stdout.write(`\x1b]52;c;${b64}\x07`);
+    console.log('\x1b[32m✔ Copied last assistant response to clipboard!\x1b[0m\n');
+  }
+
+  async exportConversation(customName) {
+    if (!this.currentConversationId) {
+      console.log('\x1b[90mNo conversation to export.\x1b[0m\n');
+      return;
+    }
+    const history = await this.client.getConversationHistory(this.currentConversationId);
+    if (history.length === 0) {
+      console.log('\x1b[90mEmpty conversation.\x1b[0m\n');
+      return;
+    }
+
+    const safeTitle = (this.currentConversationTitle || 'conversation').replace(/[^a-z0-9_-]/gi, '_').toLowerCase();
+    const fileName = customName || `${safeTitle}_${Date.now()}.md`;
+    const filePath = `${WORKSPACE_DIR}/${fileName}`;
+
+    let md = `# ${this.currentConversationTitle}\n\n`;
+    md += `*Session ID:* \`${this.currentConversationId}\`  \n`;
+    md += `*Exported:* ${new Date().toLocaleString()}  \n\n---\n\n`;
+
+    for (const msg of history) {
+      if (msg.role === 'user') {
+        md += `### 👤 User\n\n${msg.content}\n\n`;
+      } else if (msg.role === 'assistant') {
+        if (msg.thinking) {
+          md += `<details><summary><b>💭 Reasoning / Thinking</b></summary>\n\n\`\`\`\n${msg.thinking}\n\`\`\`\n</details>\n\n`;
+        }
+        if (msg.content) {
+          md += `### 🤖 Assistant (${this.currentModelDisplayName})\n\n${msg.content}\n\n`;
+        }
+      } else if (msg.role === 'tool') {
+        if (msg.toolType === 'command') {
+          md += `> ⚙ **Command:** \`${msg.command}\`\n`;
+          if (msg.output) md += `>\`\`\`\n>${msg.output.trim().replace(/\n/g, '\n>')}\n>\`\`\`\n\n`;
+        } else if (msg.toolType === 'search') {
+          md += `> 🌐 **Web Search:** \`${msg.query}\`\n\n`;
+        } else if (msg.toolType === 'code') {
+          md += `> 📝 **File Edit:** \`${msg.uri}\`\n\n`;
+        }
+      }
+    }
+
+    fs.writeFileSync(filePath, md, 'utf-8');
+    console.log(`\x1b[32m✔ Exported conversation to:\x1b[0m \x1b[1;36m${filePath}\x1b[0m\n`);
+  }
+
+  async showModifiedFiles() {
+    if (!this.currentConversationId) {
+      console.log('\x1b[90mNo active conversation.\x1b[0m\n');
+      return;
+    }
+    const tasks = await this.client.getConversationTasks(this.currentConversationId);
+    const fileEdits = tasks.filter(t => t.type === 'code' || t.label.startsWith('file://'));
+    if (fileEdits.length === 0) {
+      console.log('\x1b[90mNo file edits recorded in this session.\x1b[0m\n');
+      return;
+    }
+    console.log(`\n\x1b[1;34m=== Modified Files in Session ===\x1b[0m\n`);
+    const seen = new Set();
+    fileEdits.forEach((fe) => {
+      if (!seen.has(fe.label)) {
+        seen.add(fe.label);
+        console.log(`📝 \x1b[1;37m${fe.label}\x1b[0m [Step #${fe.stepIndex}]`);
+      }
+    });
+    console.log('\n\x1b[90m' + '─'.repeat(72) + '\x1b[0m\n');
   }
 
   async stopCurrentTurn() {
@@ -835,6 +1120,25 @@ class InteractiveApp {
           case '/open':
             await this.selectChatWithFzf();
             break;
+          case '/tasks':
+          case '/ps':
+          case '/processes':
+            await this.showTasksWithFzf();
+            break;
+          case '/kill':
+            await this.killTask(argStr);
+            break;
+          case '/copy':
+          case '/yank':
+            await this.copyLastResponse();
+            break;
+          case '/export':
+            await this.exportConversation(argStr);
+            break;
+          case '/files':
+          case '/diff':
+            await this.showModifiedFiles();
+            break;
           case '/history':
             await this.showHistory();
             break;
@@ -858,13 +1162,28 @@ class InteractiveApp {
           case '/clear':
             this.printHeader();
             break;
+          case '/help':
+            console.log('\n\x1b[1;34m=== Available Commands ===\x1b[0m');
+            console.log('  \x1b[1;37m/list, /chats\x1b[0m     Browse and open conversations (fzf)');
+            console.log('  \x1b[1;37m/tasks, /ps\x1b[0m       Inspect executed & running tasks/commands (fzf)');
+            console.log('  \x1b[1;37m/kill <step#>\x1b[0m     Kill a specific running background task');
+            console.log('  \x1b[1;37m/copy, /yank\x1b[0m      Copy last assistant response to clipboard');
+            console.log('  \x1b[1;37m/export [file]\x1b[0m    Export conversation to formatted Markdown');
+            console.log('  \x1b[1;37m/files\x1b[0m            List all files modified during this session');
+            console.log('  \x1b[1;37m/models, /model\x1b[0m   Switch active AI model (fzf)');
+            console.log('  \x1b[1;37m/quota\x1b[0m            View live subscription quota meters');
+            console.log('  \x1b[1;37m/history\x1b[0m          Print full conversation history');
+            console.log('  \x1b[1;37m/new\x1b[0m              Start a fresh conversation');
+            console.log('  \x1b[1;37m/clear\x1b[0m            Clear terminal screen');
+            console.log('  \x1b[1;37m/exit, /quit\x1b[0m      Exit application\n');
+            break;
           case '/exit':
           case '/quit':
             console.log('\nBye!\n');
             process.exit(0);
             break;
           default:
-            console.log('\x1b[31mUnknown command. Commands: /list (or /chats with fzf), /models (fzf), /new, /quota, /stop, /history, /clear, /exit\x1b[0m\n');
+            console.log('\x1b[31mUnknown command. Type `/help` for all commands.\x1b[0m\n');
         }
         this.rl.prompt();
         return;
