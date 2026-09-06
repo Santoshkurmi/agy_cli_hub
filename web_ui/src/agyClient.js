@@ -169,7 +169,30 @@ export class AntigravityBrowserClient {
     return cascadeId;
   }
 
-  // 7. Get History Steps for a Conversation
+  // 7. Get raw step count for accurate turn offsetting
+  async getRawStepCount(cascadeId) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    try {
+      const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({
+          cascade_id: cascadeId,
+          trajectory_verbosity: 2
+        })
+      });
+      if (!res.ok) return 0;
+      let count = 0;
+      await this.parseStream(res.body, (json) => {
+        count = (json.steps || []).length;
+      });
+      return count;
+    } catch {
+      return 0;
+    }
+  }
+
+  // 8. Get History Steps grouped cleanly by turn with distinct steps
   async getConversationHistory(cascadeId) {
     if (!this.csrfToken) await this.initCsrfToken();
     const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps`, {
@@ -182,50 +205,88 @@ export class AntigravityBrowserClient {
     });
     if (!res.ok) throw new Error(`GetCascadeTrajectorySteps failed: ${res.status}`);
 
-    const steps = [];
+    const turns = [];
+    let currentAssistant = null;
+
     await this.parseStream(res.body, (json) => {
-      (json.steps || []).forEach((step, idx) => {
+      const steps = json.steps || [];
+      steps.forEach((step, idx) => {
         if (step.userInput) {
           const text = step.userInput.userResponse || step.userInput.items?.[0]?.text || '';
-          if (text) steps.push({ role: 'user', content: text, stepIndex: idx });
-        } else if (step.plannerResponse) {
-          steps.push({
-            role: 'assistant',
-            content: step.plannerResponse.response || '',
-            thinking: step.plannerResponse.thinking || '',
-            toolCalls: step.plannerResponse.toolCalls || [],
-            stepIndex: idx
-          });
-        } else if (step.runCommand) {
-          steps.push({
-            role: 'tool',
-            type: 'command',
-            command: step.runCommand.commandLine || step.runCommand.proposedCommandLine,
-            output: step.runCommand.combinedOutput?.full || step.runCommand.output || '',
-            stepIndex: idx
-          });
-        } else if (step.viewFile) {
-          steps.push({
-            role: 'tool',
-            type: 'read',
-            file: step.viewFile.absolutePathUri,
-            stepIndex: idx
-          });
-        } else if (step.codeAction) {
-          steps.push({
-            role: 'tool',
-            type: 'edit',
-            uri: step.codeAction.uri,
-            diff: step.codeAction.diff,
-            stepIndex: idx
-          });
+          if (text) {
+            turns.push({ role: 'user', content: text, stepIndex: idx });
+            currentAssistant = { role: 'assistant', steps: [] };
+            turns.push(currentAssistant);
+          }
+        } else {
+          if (!currentAssistant) {
+            currentAssistant = { role: 'assistant', steps: [] };
+            turns.push(currentAssistant);
+          }
+
+          if (step.plannerResponse) {
+            const thinking = step.plannerResponse.thinking || '';
+            const content = step.plannerResponse.response || '';
+            if (thinking || content) {
+              currentAssistant.steps.push({
+                stepIndex: idx,
+                type: 'planner',
+                thinking,
+                content
+              });
+            }
+          } else if (step.runCommand) {
+            const cmd = step.runCommand.commandLine || step.runCommand.proposedCommandLine;
+            const out = step.runCommand.combinedOutput?.full || step.runCommand.output || '';
+            currentAssistant.steps.push({
+              stepIndex: idx,
+              type: 'tool',
+              toolType: 'command',
+              command: cmd,
+              output: out
+            });
+          } else if (step.viewFile) {
+            const path = step.viewFile.absolutePathUri || 'File';
+            currentAssistant.steps.push({
+              stepIndex: idx,
+              type: 'tool',
+              toolType: 'read',
+              label: `Read: ${path}`,
+              file: path
+            });
+          } else if (step.codeAction) {
+            currentAssistant.steps.push({
+              stepIndex: idx,
+              type: 'tool',
+              toolType: 'edit',
+              label: `Edit: ${step.codeAction.uri}`,
+              diff: step.codeAction.diff
+            });
+          } else if (step.searchWeb) {
+            currentAssistant.steps.push({
+              stepIndex: idx,
+              type: 'tool',
+              toolType: 'search',
+              label: `Web Search: ${step.searchWeb.query || ''}`,
+              query: step.searchWeb.query || '',
+              output: step.searchWeb.summary || ''
+            });
+          } else if (step.metadata?.toolAction || step.generic) {
+            currentAssistant.steps.push({
+              stepIndex: idx,
+              type: 'tool',
+              toolType: 'generic',
+              label: step.metadata?.toolAction || step.generic?.toolAction || 'Tool Action'
+            });
+          }
         }
       });
     });
-    return steps;
+
+    return turns.filter(t => t.role === 'user' || (t.steps && t.steps.length > 0));
   }
 
-  // 8. Send User Prompt Message
+  // 9. Send User Prompt Message
   async sendMessage({ cascadeId, text, modelEnum, thinkingBudget = 8192, autoExecute = true }) {
     if (!this.csrfToken) await this.initCsrfToken();
     const payload = {
@@ -268,8 +329,8 @@ export class AntigravityBrowserClient {
     return res;
   }
 
-  // 9. Stream Live Agent State Updates directly in browser
-  async streamUpdates(cascadeId, onUpdate, abortSignal) {
+  // 10. Stream Live Agent State Updates starting from startStepIndex
+  async streamUpdates(cascadeId, onUpdate, abortSignal, startStepIndex = 0) {
     if (!this.csrfToken) await this.initCsrfToken();
     const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates`, {
       method: 'POST',
@@ -277,7 +338,10 @@ export class AntigravityBrowserClient {
       body: this.encodeFrame({
         conversationId: cascadeId,
         subscriberId: `web-sub-${Date.now()}`,
-        trajectoryVerbosity: 2
+        trajectoryVerbosity: 2,
+        initialStepsPageBounds: {
+          startIndex: startStepIndex
+        }
       }),
       signal: abortSignal
     });
@@ -285,6 +349,7 @@ export class AntigravityBrowserClient {
 
     const stepResponseOffsets = new Map();
     const stepThinkingOffsets = new Map();
+    const seenToolSteps = new Set();
     let hasSeenRunningState = false;
 
     await this.parseStream(res.body, (chunk) => {
@@ -300,8 +365,13 @@ export class AntigravityBrowserClient {
 
       for (let i = 0; i < steps.length; i++) {
         const stepIndex = indices[i] !== undefined ? indices[i] : i;
+        
+        // CRITICAL: Skip all steps belonging to previous turns
+        if (stepIndex < startStepIndex) continue;
+
         const step = steps[i];
 
+        // 1. Thinking
         if (step.plannerResponse?.thinking) {
           const full = step.plannerResponse.thinking;
           const prev = stepThinkingOffsets.get(stepIndex) || 0;
@@ -312,6 +382,7 @@ export class AntigravityBrowserClient {
           }
         }
 
+        // 2. Response content
         if (step.plannerResponse?.response) {
           const full = step.plannerResponse.response;
           const prev = stepResponseOffsets.get(stepIndex) || 0;
@@ -322,30 +393,70 @@ export class AntigravityBrowserClient {
           }
         }
 
+        // 3. Tools (Deduplicated per stepIndex)
         if (step.runCommand) {
-          onUpdate({
-            type: 'command',
-            command: step.runCommand.commandLine || step.runCommand.proposedCommandLine,
-            output: step.runCommand.combinedOutput?.full || step.runCommand.output || '',
-            stepIndex
-          });
+          const cmd = step.runCommand.commandLine || step.runCommand.proposedCommandLine;
+          const out = step.runCommand.combinedOutput?.full || step.runCommand.output || '';
+          if (!seenToolSteps.has(`cmd-${stepIndex}`)) {
+            seenToolSteps.add(`cmd-${stepIndex}`);
+            onUpdate({
+              type: 'tool',
+              toolType: 'command',
+              command: cmd,
+              output: out,
+              stepIndex
+            });
+          } else {
+            onUpdate({
+              type: 'tool_output',
+              output: out,
+              stepIndex
+            });
+          }
         }
 
-        if (step.viewFile) {
+        if (step.viewFile && !seenToolSteps.has(`read-${stepIndex}`)) {
+          seenToolSteps.add(`read-${stepIndex}`);
           onUpdate({
-            type: 'read',
+            type: 'tool',
+            toolType: 'read',
+            label: `Read: ${step.viewFile.absolutePathUri}`,
             file: step.viewFile.absolutePathUri,
             stepIndex
           });
         }
 
-        if (step.codeAction) {
+        if (step.codeAction && !seenToolSteps.has(`edit-${stepIndex}`)) {
+          seenToolSteps.add(`edit-${stepIndex}`);
           onUpdate({
-            type: 'edit',
-            uri: step.codeAction.uri,
+            type: 'tool',
+            toolType: 'edit',
+            label: `Edit: ${step.codeAction.uri}`,
             diff: step.codeAction.diff,
             stepIndex
           });
+        }
+
+        if (step.searchWeb) {
+          const query = step.searchWeb.query || '';
+          const summary = step.searchWeb.summary || '';
+          if (!seenToolSteps.has(`search-${stepIndex}`)) {
+            seenToolSteps.add(`search-${stepIndex}`);
+            onUpdate({
+              type: 'tool',
+              toolType: 'search',
+              label: `Web Search: ${query}`,
+              query,
+              output: summary,
+              stepIndex
+            });
+          } else if (summary) {
+            onUpdate({
+              type: 'tool_output',
+              output: summary,
+              stepIndex
+            });
+          }
         }
       }
 
@@ -355,7 +466,7 @@ export class AntigravityBrowserClient {
     });
   }
 
-  // 10. Stop execution
+  // 11. Stop execution
   async stop(cascadeId) {
     if (!this.csrfToken) await this.initCsrfToken();
     const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/CancelCascadeInvocation`, {

@@ -11,7 +11,10 @@ import {
   ChevronUp,
   Zap,
   Settings,
-  RefreshCw
+  RefreshCw,
+  FileText,
+  Search,
+  Code
 } from 'lucide-react';
 import { AntigravityBrowserClient } from './agyClient';
 
@@ -31,6 +34,7 @@ export default function App() {
   const [inputPrompt, setInputPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
   const [collapsedThinking, setCollapsedThinking] = useState({});
+  const [collapsedTools, setCollapsedTools] = useState({});
   const [showConfig, setShowConfig] = useState(false);
 
   const messagesEndRef = useRef(null);
@@ -136,65 +140,82 @@ export default function App() {
     const currentPrompt = inputPrompt;
     setInputPrompt('');
 
-    // Append user message & placeholder assistant turn
+    // 1. Get current step count so streamUpdates ignores prior turns
+    let startStepIndex = 0;
+    try {
+      startStepIndex = await client.getRawStepCount(targetSessionId);
+    } catch {}
+
+    // 2. Append user message & placeholder assistant turn
     const userMsg = { role: 'user', content: currentPrompt };
-    const assistantMsg = { role: 'assistant', content: '', thinking: '', tools: [] };
+    const assistantMsg = { role: 'assistant', steps: [] };
     setMessages(prev => [...prev, userMsg, assistantMsg]);
     setIsGenerating(true);
 
     try {
-      // 1. Send User Cascade Message directly
+      // 3. Send User Cascade Message directly
       await client.sendMessage({
         cascadeId: targetSessionId,
         text: currentPrompt,
-        modelEnum: selectedModel,
+        modelEnum: modelToUse,
         thinkingBudget: parseInt(thinkingBudget, 10),
         autoExecute
       });
 
-      // 2. Stream Agent Updates directly in browser
+      // 4. Stream Agent Updates starting strictly after startStepIndex
       const controller = new AbortController();
       abortControllerRef.current = controller;
 
       await client.streamUpdates(targetSessionId, (update) => {
-        if (update.type === 'thinking') {
-          setMessages(prev => {
-            const clone = [...prev];
-            const last = clone[clone.length - 1];
-            if (last && last.role === 'assistant') {
-              last.thinking = (last.thinking || '') + update.delta;
-            }
-            return clone;
-          });
-        } else if (update.type === 'content') {
-          setMessages(prev => {
-            const clone = [...prev];
-            const last = clone[clone.length - 1];
-            if (last && last.role === 'assistant') {
-              last.content = (last.content || '') + update.delta;
-            }
-            return clone;
-          });
-        } else if (update.type === 'command') {
-          setMessages(prev => {
-            const clone = [...prev];
-            const last = clone[clone.length - 1];
-            if (last && last.role === 'assistant') {
-              last.tools = last.tools || [];
-              const existing = last.tools.find(t => t.command === update.command);
-              if (existing) {
-                existing.output = update.output;
-              } else {
-                last.tools.push({ type: 'command', command: update.command, output: update.output });
-              }
-            }
-            return clone;
-          });
-        } else if (update.type === 'done') {
+        if (update.type === 'done') {
           setIsGenerating(false);
           client.listConversations().then(setConversations);
+          return;
         }
-      }, controller.signal);
+
+        setMessages(prev => {
+          const clone = [...prev];
+          const lastIdx = clone.length - 1;
+          if (lastIdx < 0 || clone[lastIdx].role !== 'assistant') return clone;
+
+          const last = { ...clone[lastIdx], steps: [...(clone[lastIdx].steps || [])] };
+          clone[lastIdx] = last;
+
+          let stepObj = last.steps.find(s => s.stepIndex === update.stepIndex);
+
+          if (update.type === 'thinking') {
+            if (!stepObj) {
+              stepObj = { stepIndex: update.stepIndex, type: 'planner', thinking: update.delta, content: '' };
+              last.steps.push(stepObj);
+            } else {
+              const sIdx = last.steps.indexOf(stepObj);
+              last.steps[sIdx] = { ...stepObj, thinking: (stepObj.thinking || '') + update.delta };
+            }
+          } else if (update.type === 'content') {
+            if (!stepObj) {
+              stepObj = { stepIndex: update.stepIndex, type: 'planner', thinking: '', content: update.delta };
+              last.steps.push(stepObj);
+            } else {
+              const sIdx = last.steps.indexOf(stepObj);
+              last.steps[sIdx] = { ...stepObj, content: (stepObj.content || '') + update.delta };
+            }
+          } else if (update.type === 'tool') {
+            if (!stepObj) {
+              stepObj = { stepIndex: update.stepIndex, ...update };
+              last.steps.push(stepObj);
+            } else {
+              const sIdx = last.steps.indexOf(stepObj);
+              last.steps[sIdx] = { ...stepObj, ...update };
+            }
+          } else if (update.type === 'tool_output') {
+            if (stepObj) {
+              const sIdx = last.steps.indexOf(stepObj);
+              last.steps[sIdx] = { ...stepObj, output: update.output };
+            }
+          }
+          return clone;
+        });
+      }, controller.signal, startStepIndex);
 
     } catch (err) {
       if (err.name !== 'AbortError') {
@@ -214,10 +235,17 @@ export default function App() {
     setIsGenerating(false);
   };
 
-  const toggleThinking = (idx) => {
+  const toggleThinking = (key) => {
     setCollapsedThinking(prev => ({
       ...prev,
-      [idx]: !prev[idx]
+      [key]: !prev[key]
+    }));
+  };
+
+  const toggleTool = (key) => {
+    setCollapsedTools(prev => ({
+      ...prev,
+      [key]: !prev[key]
     }));
   };
 
@@ -364,44 +392,107 @@ export default function App() {
                 <div className="message-user">{msg.content}</div>
               ) : (
                 <div className="message-assistant">
-                  {/* Thinking Block */}
-                  {msg.thinking && (
-                    <div className="thinking-box">
-                      <div className="thinking-header" onClick={() => toggleThinking(idx)}>
-                        <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                          <Brain size={14} />
-                          {isGenerating && idx === messages.length - 1 ? 'Reasoning in progress...' : 'Thought Process'}
-                        </span>
-                        {collapsedThinking[idx] ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
-                      </div>
-                      {!collapsedThinking[idx] && (
-                        <div className="thinking-content">{msg.thinking}</div>
-                      )}
-                    </div>
-                  )}
+                  {/* Step-based execution stream (Thinking, Tools, and Content in chronological order) */}
+                  {msg.steps && msg.steps.length > 0 ? (
+                    msg.steps.map((step, sIdx) => {
+                      if (step.type === 'planner') {
+                        const thinkKey = `${idx}-${step.stepIndex}`;
+                        return (
+                          <div key={sIdx} className="step-block">
+                            {step.thinking && (
+                              <div className="thinking-box">
+                                <div className="thinking-header" onClick={() => toggleThinking(thinkKey)}>
+                                  <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                    <Brain size={14} />
+                                    {isGenerating && idx === messages.length - 1 && !step.content ? 'Reasoning in progress...' : 'Thought Process'}
+                                  </span>
+                                  {collapsedThinking[thinkKey] ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                                </div>
+                                {!collapsedThinking[thinkKey] && (
+                                  <div className="thinking-content">{step.thinking}</div>
+                                )}
+                              </div>
+                            )}
+                            {step.content && (
+                              <div className="assistant-text">{step.content}</div>
+                            )}
+                          </div>
+                        );
+                      }
 
-                  {/* Tool Executions */}
-                  {msg.tools && msg.tools.map((tool, tIdx) => (
-                    <div key={tIdx} className="tool-box">
-                      <div className="tool-header">
-                        <Terminal size={14} />
-                        <span>Terminal Execution: {tool.command}</span>
-                      </div>
-                      {tool.output && (
-                        <div className="tool-content">{tool.output}</div>
-                      )}
-                    </div>
-                  ))}
+                      if (step.type === 'tool') {
+                        const toolKey = `${idx}-${step.stepIndex}`;
+                        const isCollapsed = collapsedTools[toolKey];
+                        return (
+                          <div key={sIdx} className="tool-box">
+                            <div 
+                              className="tool-header" 
+                              onClick={() => toggleTool(toolKey)}
+                              style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                            >
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                {step.toolType === 'command' && <Terminal size={14} />}
+                                {step.toolType === 'read' && <FileText size={14} />}
+                                {step.toolType === 'edit' && <Code size={14} />}
+                                {step.toolType === 'search' && <Search size={14} />}
+                                {step.toolType !== 'command' && step.toolType !== 'read' && step.toolType !== 'edit' && step.toolType !== 'search' && <Terminal size={14} />}
+                                <span>{step.label || (step.command ? `Terminal: ${step.command}` : 'Tool Execution')}</span>
+                              </div>
+                              {(step.output || step.diff) && (
+                                <span style={{ color: '#64748b' }}>
+                                  {isCollapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                                </span>
+                              )}
+                            </div>
+                            {!isCollapsed && (
+                              <>
+                                {step.output && (
+                                  <div className="tool-content">{step.output}</div>
+                                )}
+                                {step.diff && (
+                                  <div className="tool-content">{step.diff}</div>
+                                )}
+                              </>
+                            )}
+                          </div>
+                        );
+                      }
 
-                  {/* Direct Response Text */}
-                  {msg.content ? (
-                    <div className="assistant-text">{msg.content}</div>
+                      return null;
+                    })
                   ) : (
-                    isGenerating && idx === messages.length - 1 && !msg.thinking && (
-                      <div style={{ color: '#64748b', fontSize: '13px', fontStyle: 'italic' }}>
-                        Waiting for response...
-                      </div>
-                    )
+                    /* Fallback for legacy messages or waiting state */
+                    <>
+                      {msg.thinking && (
+                        <div className="thinking-box">
+                          <div className="thinking-header" onClick={() => toggleThinking(idx)}>
+                            <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                              <Brain size={14} />
+                              Thought Process
+                            </span>
+                            {collapsedThinking[idx] ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                          </div>
+                          {!collapsedThinking[idx] && (
+                            <div className="thinking-content">{msg.thinking}</div>
+                          )}
+                        </div>
+                      )}
+                      {msg.tools && msg.tools.map((tool, tIdx) => (
+                        <div key={tIdx} className="tool-box">
+                          <div className="tool-header">
+                            <Terminal size={14} />
+                            <span>{tool.label || tool.command}</span>
+                          </div>
+                          {tool.output && <div className="tool-content">{tool.output}</div>}
+                        </div>
+                      ))}
+                      {msg.content && <div className="assistant-text">{msg.content}</div>}
+                      {isGenerating && idx === messages.length - 1 && (
+                        <div style={{ color: '#64748b', fontSize: '13px', fontStyle: 'italic' }}>
+                          Waiting for response...
+                        </div>
+                      )}
+                    </>
                   )}
                 </div>
               )}
