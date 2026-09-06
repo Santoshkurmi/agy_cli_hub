@@ -1016,7 +1016,10 @@ export default function App() {
 
                       if (step.type === 'tool') {
                         const toolKey = `${idx}-${step.stepIndex}`;
-                        const isCollapsed = collapsedTools[toolKey];
+                        const isFailed = Boolean(step.error || step.status === 'CORTEX_STEP_STATUS_ERROR');
+                        // Failed tools default to EXPANDED so the user immediately sees the error!
+                        const isCollapsed = collapsedTools[toolKey] !== undefined ? collapsedTools[toolKey] : false;
+
                         // True approval required ONLY if step is specifically waiting on user OR proposed in OFF mode with no output
                         const isAwaitingApproval = !step.output && !step.error && (
                           step.status === 'CORTEX_STEP_STATUS_WAITING' ||
@@ -1028,19 +1031,34 @@ export default function App() {
                           (isGenerating && sIdx === (msg.steps || []).length - 1 && step.status !== 'CORTEX_STEP_STATUS_ERROR' && step.status !== 'CORTEX_STEP_STATUS_DONE')
                         );
                         return (
-                          <div key={sIdx} className="tool-box">
+                          <div key={sIdx} className={`tool-box ${isFailed ? 'tool-failed' : ''}`} style={isFailed ? { borderColor: 'rgba(239, 68, 68, 0.4)' } : {}}>
                             <div
                               className="tool-header"
                               onClick={() => toggleTool(toolKey)}
                               style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
                             >
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                {step.toolType === 'command' && <Terminal size={14} />}
-                                {step.toolType === 'read' && <FileText size={14} />}
-                                {step.toolType === 'edit' && <Code size={14} />}
-                                {step.toolType === 'search' && <Search size={14} />}
-                                {step.toolType !== 'command' && step.toolType !== 'read' && step.toolType !== 'edit' && step.toolType !== 'search' && <Terminal size={14} />}
-                                <span>{step.label || (step.command ? `Terminal: ${step.command}` : 'Tool Execution')}</span>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
+                                {isFailed ? (
+                                  <AlertCircle size={14} color="#f87171" style={{ flexShrink: 0 }} />
+                                ) : step.toolType === 'command' ? (
+                                  <Terminal size={14} style={{ flexShrink: 0 }} />
+                                ) : step.toolType === 'read' ? (
+                                  <FileText size={14} color="#38bdf8" style={{ flexShrink: 0 }} />
+                                ) : step.toolType === 'edit' ? (
+                                  <Code size={14} color="#a855f7" style={{ flexShrink: 0 }} />
+                                ) : step.toolType === 'search' ? (
+                                  <Search size={14} color="#34d399" style={{ flexShrink: 0 }} />
+                                ) : (
+                                  <Terminal size={14} style={{ flexShrink: 0 }} />
+                                )}
+                                <span style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                                  {step.label || (step.command ? `Terminal: ${step.command}` : 'Tool Execution')}
+                                </span>
+                                {isFailed && (
+                                  <span style={{ fontSize: '11px', background: 'rgba(239, 68, 68, 0.2)', color: '#f87171', padding: '1px 6px', borderRadius: '4px', fontWeight: 600, flexShrink: 0 }}>
+                                    Failed
+                                  </span>
+                                )}
                               </div>
                               {(step.output || step.diff || step.error) && (
                                 <span style={{ color: '#64748b' }}>
@@ -1050,14 +1068,17 @@ export default function App() {
                             </div>
                             {!isCollapsed && (
                               <>
-                                {step.output && (
-                                  <div className="tool-content">{step.output}</div>
+                                {step.error && (
+                                  <div style={{ padding: '8px 12px', background: 'rgba(239, 68, 68, 0.12)', borderLeft: '3px solid #ef4444', color: '#fca5a5', fontSize: '12px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: '4px 8px', borderRadius: '0 4px 4px 0' }}>
+                                    <div style={{ fontWeight: 600, marginBottom: '2px', color: '#ef4444' }}>Execution Error:</div>
+                                    {step.error}
+                                  </div>
                                 )}
                                 {step.diff && (
                                   <div className="tool-content">{step.diff}</div>
                                 )}
-                                {step.error && !step.output && (
-                                  <div className="tool-content" style={{ color: '#ef4444' }}>{step.error}</div>
+                                {step.output && (!step.error || step.output !== `Search failed: ${step.error}`) && (
+                                  <div className="tool-content">{step.output}</div>
                                 )}
                                 {step.toolType === 'command' && isRunning && (
                                   <div style={{ padding: '8px 12px', fontSize: '12px', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '8px' }}>

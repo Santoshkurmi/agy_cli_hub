@@ -465,21 +465,61 @@ export class AntigravityBrowserClient {
             trajectoryId
           });
         } else if (step.viewFile) {
-          const path = step.viewFile.absolutePathUri || 'File';
+          const rawUri = step.viewFile.absolutePathUri || step.viewFile.uri || '';
+          const filePath = rawUri.replace(/^file:\/\//, '') || 'File';
+          const fileName = filePath.split('/').filter(Boolean).pop() || filePath;
+          const startLine = step.viewFile.startLine ?? (step.viewFile.endLine ? 1 : undefined);
+          const endLine = step.viewFile.endLine;
+          const rangeStr = (startLine !== undefined && endLine !== undefined)
+            ? `L${startLine}-L${endLine}`
+            : (step.viewFile.numLines ? `${step.viewFile.numLines} lines` : '');
+          const label = `Read: ${fileName}${rangeStr ? ` (${rangeStr})` : ''}`;
+          const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
+
+          const metaLines = [];
+          metaLines.push(`File: ${filePath}`);
+          if (rangeStr) metaLines.push(`Range: ${rangeStr}`);
+          if (step.viewFile.numBytes) metaLines.push(`Size: ${step.viewFile.numBytes.toLocaleString()} bytes`);
+          let out = metaLines.join('\n');
+          if (step.viewFile.content) {
+            out += `\n\n--- Content ---\n${step.viewFile.content}`;
+          }
+
           currentAssistant.steps.push({
             stepIndex,
             type: 'tool',
             toolType: 'read',
-            label: `Read: ${path}`,
-            file: path
+            label,
+            file: filePath,
+            range: rangeStr,
+            output: out,
+            error: err,
+            status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE')
           });
         } else if (step.codeAction) {
+          const rawUri = step.codeAction.uri || step.codeAction.actionSpec?.command?.file?.absoluteUri || step.codeAction.actionResult?.edit?.absoluteUri || '';
+          const filePath = rawUri.replace(/^file:\/\//, '') || 'File';
+          const fileName = filePath.split('/').filter(Boolean).pop() || filePath;
+          const chunk = step.codeAction.replacementInfos?.[0]?.originalChunk;
+          const startLine = chunk?.startLine;
+          const endLine = chunk?.endLine;
+          const rangeStr = (startLine !== undefined && endLine !== undefined) ? `L${startLine}-L${endLine}` : '';
+          const diffStats = step.codeAction.diffStats;
+          const statsStr = diffStats ? `(+${diffStats.additions || 0}, -${diffStats.deletions || 0})` : '';
+          const label = `Edit: ${fileName}${rangeStr ? ` (${rangeStr})` : ''} ${statsStr}`.trim();
+          const diff = step.codeAction.diff || step.codeAction.content || (chunk ? `@@ -${startLine},${(endLine - startLine + 1)} @@\n-${chunk.targetContent}\n+${chunk.replacementContent}` : '');
+          const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
+
           currentAssistant.steps.push({
             stepIndex,
             type: 'tool',
             toolType: 'edit',
-            label: `Edit: ${step.codeAction.uri}`,
-            diff: step.codeAction.diff
+            label,
+            file: filePath,
+            range: rangeStr,
+            diff,
+            error: err,
+            status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE')
           });
         } else if (step.notifyUser) {
           currentAssistant.steps.push({
@@ -492,13 +532,21 @@ export class AntigravityBrowserClient {
             confidence: step.notifyUser.confidenceScore || null
           });
         } else if (step.searchWeb) {
+          const query = step.searchWeb.query || '';
+          const summary = step.searchWeb.summary || '';
+          const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
+          const label = `Web Search: ${query || 'Search'}`;
+          const output = summary || (err ? `Search failed: ${err}` : `Query: ${query}`);
+
           currentAssistant.steps.push({
             stepIndex,
             type: 'tool',
             toolType: 'search',
-            label: `Web Search: ${step.searchWeb.query || ''}`,
-            query: step.searchWeb.query || '',
-            output: step.searchWeb.summary || ''
+            label,
+            query,
+            output,
+            error: err,
+            status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE')
           });
         } else if (step.metadata?.toolAction || step.generic) {
           currentAssistant.steps.push({
@@ -872,22 +920,59 @@ export class AntigravityBrowserClient {
 
           if (step.viewFile && !seenToolSteps.has(`read-${stepIndex}`)) {
             seenToolSteps.add(`read-${stepIndex}`);
+            const rawUri = step.viewFile.absolutePathUri || step.viewFile.uri || '';
+            const filePath = rawUri.replace(/^file:\/\//, '') || 'File';
+            const fileName = filePath.split('/').filter(Boolean).pop() || filePath;
+            const startLine = step.viewFile.startLine ?? (step.viewFile.endLine ? 1 : undefined);
+            const endLine = step.viewFile.endLine;
+            const rangeStr = (startLine !== undefined && endLine !== undefined)
+              ? `L${startLine}-L${endLine}`
+              : (step.viewFile.numLines ? `${step.viewFile.numLines} lines` : '');
+            const label = `Read: ${fileName}${rangeStr ? ` (${rangeStr})` : ''}`;
+            const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
+            const metaLines = [`File: ${filePath}`];
+            if (rangeStr) metaLines.push(`Range: ${rangeStr}`);
+            if (step.viewFile.numBytes) metaLines.push(`Size: ${step.viewFile.numBytes.toLocaleString()} bytes`);
+            let out = metaLines.join('\n');
+            if (step.viewFile.content) {
+              out += `\n\n--- Content ---\n${step.viewFile.content}`;
+            }
             onUpdate({
               type: 'tool',
               toolType: 'read',
-              label: `Read: ${step.viewFile.absolutePathUri}`,
-              file: step.viewFile.absolutePathUri,
+              label,
+              file: filePath,
+              range: rangeStr,
+              output: out,
+              error: err,
+              status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE'),
               stepIndex
             });
           }
 
           if (step.codeAction && !seenToolSteps.has(`edit-${stepIndex}`)) {
             seenToolSteps.add(`edit-${stepIndex}`);
+            const rawUri = step.codeAction.uri || step.codeAction.actionSpec?.command?.file?.absoluteUri || step.codeAction.actionResult?.edit?.absoluteUri || '';
+            const filePath = rawUri.replace(/^file:\/\//, '') || 'File';
+            const fileName = filePath.split('/').filter(Boolean).pop() || filePath;
+            const chunk = step.codeAction.replacementInfos?.[0]?.originalChunk;
+            const startLine = chunk?.startLine;
+            const endLine = chunk?.endLine;
+            const rangeStr = (startLine !== undefined && endLine !== undefined) ? `L${startLine}-L${endLine}` : '';
+            const diffStats = step.codeAction.diffStats;
+            const statsStr = diffStats ? `(+${diffStats.additions || 0}, -${diffStats.deletions || 0})` : '';
+            const label = `Edit: ${fileName}${rangeStr ? ` (${rangeStr})` : ''} ${statsStr}`.trim();
+            const diff = step.codeAction.diff || step.codeAction.content || (chunk ? `@@ -${startLine},${(endLine - startLine + 1)} @@\n-${chunk.targetContent}\n+${chunk.replacementContent}` : '');
+            const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
             onUpdate({
               type: 'tool',
               toolType: 'edit',
-              label: `Edit: ${step.codeAction.uri}`,
-              diff: step.codeAction.diff,
+              label,
+              file: filePath,
+              range: rangeStr,
+              diff,
+              error: err,
+              status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE'),
               stepIndex
             });
           }
@@ -908,20 +993,29 @@ export class AntigravityBrowserClient {
           if (step.searchWeb) {
             const query = step.searchWeb.query || '';
             const summary = step.searchWeb.summary || '';
+            const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
+            const label = `Web Search: ${query || 'Search'}`;
+            const output = summary || (err ? `Search failed: ${err}` : (query ? `Query: ${query}` : ''));
+            const status = step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : (summary ? 'CORTEX_STEP_STATUS_DONE' : 'CORTEX_STEP_STATUS_RUNNING'));
+
             if (!seenToolSteps.has(`search-${stepIndex}`)) {
               seenToolSteps.add(`search-${stepIndex}`);
               onUpdate({
                 type: 'tool',
                 toolType: 'search',
-                label: `Web Search: ${query}`,
+                label,
                 query,
-                output: summary,
+                output,
+                error: err,
+                status,
                 stepIndex
               });
-            } else if (summary) {
+            } else if (summary || err) {
               onUpdate({
                 type: 'tool_output',
-                output: summary,
+                output,
+                error: err,
+                status,
                 stepIndex
               });
             }
