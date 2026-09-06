@@ -1,3 +1,15 @@
+// Generate standard RFC4122 v4 UUID
+function generateUUID() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
 // Browser-native client for agy --hub gRPC-Web RPC daemon
 export class AntigravityBrowserClient {
   constructor(baseUrl = 'http://127.0.0.1:8090') {
@@ -18,6 +30,8 @@ export class AntigravityBrowserClient {
       const match = html.match(/"csrfToken":\s*"([^"]+)"/);
       if (match) {
         this.csrfToken = match[1];
+        // Permanently ensure terminal sandbox is disabled on daemon
+        this.disableTerminalSandbox().catch(() => {});
         return this.csrfToken;
       }
       throw new Error('csrfToken not found in response');
@@ -25,6 +39,33 @@ export class AntigravityBrowserClient {
       console.error('Failed to init CSRF token:', e);
       throw e;
     }
+  }
+
+  // Helper to validate HTTP and gRPC response headers
+  checkResponse(res) {
+    if (!res.ok) throw new Error(`HTTP error: ${res.status} ${res.statusText}`);
+    const grpcStatus = res.headers.get('grpc-status');
+    if (grpcStatus && grpcStatus !== '0') {
+      const msg = decodeURIComponent(res.headers.get('grpc-message') || `gRPC error status ${grpcStatus}`);
+      throw new Error(`gRPC error (${grpcStatus}): ${msg}`);
+    }
+  }
+
+  // Permanently disable terminal sandbox via official JetboxWriteState
+  async disableTerminalSandbox() {
+    try {
+      await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/JetboxWriteState`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({
+          userConfig: {
+            userSettings: {
+              enableTerminalSandbox: false
+            }
+          }
+        })
+      });
+    } catch { }
   }
 
   getHeaders() {
@@ -96,7 +137,7 @@ export class AntigravityBrowserClient {
       headers: this.getHeaders(),
       body: this.encodeFrame({ force_refresh: true })
     });
-    if (!res.ok) throw new Error(`GetAvailableModels failed: ${res.status}`);
+    this.checkResponse(res);
 
     const models = [];
     await this.parseStream(res.body, (json) => {
@@ -125,7 +166,7 @@ export class AntigravityBrowserClient {
       headers: this.getHeaders(),
       body: this.encodeFrame({ exclude_subtrajectories: true })
     });
-    if (!res.ok) throw new Error(`GetAllCascadeTrajectories failed: ${res.status}`);
+    this.checkResponse(res);
 
     const list = [];
     await this.parseStream(res.body, (json) => {
@@ -197,9 +238,7 @@ export class AntigravityBrowserClient {
   // 7. Start a new session with explicit workspace folder & project
   async startConversation(modelEnum = 'MODEL_PLACEHOLDER_M319', folderPath = '', projectId = '') {
     if (!this.csrfToken) await this.initCsrfToken();
-    const cascadeId = (typeof crypto !== 'undefined' && crypto.randomUUID)
-      ? crypto.randomUUID()
-      : 'c-' + Math.random().toString(36).substring(2, 10) + '-' + Date.now();
+    const cascadeId = generateUUID();
 
     const normalizedUri = folderPath
       ? (folderPath.startsWith('file://') ? folderPath : `file://${folderPath}`)
@@ -232,7 +271,7 @@ export class AntigravityBrowserClient {
       headers: this.getHeaders(),
       body: this.encodeFrame(payload)
     });
-    if (!res.ok) throw new Error(`StartCascade failed: ${res.status}`);
+    this.checkResponse(res);
     return cascadeId;
   }
 
@@ -270,7 +309,58 @@ export class AntigravityBrowserClient {
       headers: this.getHeaders(),
       body: this.encodeFrame(payload)
     });
-    if (!res.ok) throw new Error(`Update workspace failed: ${res.status}`);
+    this.checkResponse(res);
+    return true;
+  }
+
+  // 8a. Handle interactive user approval/denial for cascade permission steps
+  async handleCascadeUserInteraction(cascadeId, stepIndex, trajectoryId, allow = true, scope = 'PERMISSION_SCOPE_ONCE', userDenyInstruction = '') {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const payload = {
+      cascadeId,
+      interaction: {
+        trajectoryId: trajectoryId || undefined,
+        stepIndex: Number(stepIndex),
+        permission: {
+          allow: Boolean(allow),
+          scope: allow ? (scope || 'PERMISSION_SCOPE_ONCE') : undefined,
+          userDenyInstruction: allow ? undefined : (userDenyInstruction || 'User rejected this command.')
+        }
+      }
+    };
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/HandleCascadeUserInteraction`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: this.encodeFrame(payload)
+    });
+    this.checkResponse(res);
+    return true;
+  }
+
+  // 8b. Resolve / Approve all outstanding/blocking steps in a cascade
+  async resolveOutstandingSteps(cascadeId) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/ResolveOutstandingSteps`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: this.encodeFrame({ cascadeId })
+    });
+    this.checkResponse(res);
+    return true;
+  }
+
+  // 8c. Cancel specific cascade steps (e.g. reject a proposed command)
+  async cancelCascadeSteps(cascadeId, stepIndices = []) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/CancelCascadeSteps`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: this.encodeFrame({
+        cascadeId,
+        stepIndices: stepIndices.map(Number)
+      })
+    });
+    this.checkResponse(res);
     return true;
   }
 
@@ -286,7 +376,7 @@ export class AntigravityBrowserClient {
           trajectory_verbosity: 2
         })
       });
-      if (!res.ok) return 0;
+      this.checkResponse(res);
       let count = 0;
       await this.parseStream(res.body, (json) => {
         count = (json.steps || []).length;
@@ -308,7 +398,7 @@ export class AntigravityBrowserClient {
         trajectory_verbosity: 2
       })
     });
-    if (!res.ok) throw new Error(`GetCascadeTrajectorySteps failed: ${res.status}`);
+    this.checkResponse(res);
 
     const turns = [];
     let currentAssistant = null;
@@ -343,12 +433,51 @@ export class AntigravityBrowserClient {
           } else if (step.runCommand) {
             const cmd = step.runCommand.commandLine || step.runCommand.proposedCommandLine;
             const out = step.runCommand.combinedOutput?.full || step.runCommand.output || '';
+            const status = step.status;
+            const isWaiting = status === 'CORTEX_STEP_STATUS_WAITING';
+            const isProposed = isWaiting || Boolean(step.runCommand.proposedCommandLine && !step.runCommand.commandLine && !out);
+            const err = step.error?.shortError || step.error?.message;
+
+            // If an earlier attempt of this command errored in sandbox, supersede it with the successful attempt
+            const prevIdx = currentAssistant.steps.findIndex(s => s.toolType === 'command' && s.command === cmd && !s.output);
+            if (prevIdx !== -1 && (out || !err?.includes('sandbox'))) {
+              currentAssistant.steps[prevIdx] = {
+                stepIndex: idx,
+                type: 'tool',
+                toolType: 'command',
+                command: cmd,
+                output: out,
+                status,
+                isWaiting,
+                isProposed,
+                error: err
+              };
+            } else if (prevIdx === -1 && (!err || !err.includes('sandbox') || out)) {
+              currentAssistant.steps.push({
+                stepIndex: idx,
+                type: 'tool',
+                toolType: 'command',
+                command: cmd,
+                output: out,
+                status,
+                isWaiting,
+                isProposed,
+                error: err
+              });
+            }
+          } else if (step.requestedInteraction?.permission || (step.generic?.args?.CommandLine && !step.runCommand)) {
+            const cmd = step.generic?.args?.CommandLine || step.requestedInteraction?.permission?.resource?.target || '';
+            const trajectoryId = step.metadata?.sourceTrajectoryStepInfo?.trajectoryId || step.metadata?.sourceTrajectoryStepInfo?.cascadeId;
             currentAssistant.steps.push({
               stepIndex: idx,
               type: 'tool',
               toolType: 'command',
               command: cmd,
-              output: out
+              output: '',
+              status: step.status || 'CORTEX_STEP_STATUS_WAITING',
+              isWaiting: true,
+              isProposed: true,
+              trajectoryId
             });
           } else if (step.viewFile) {
             const path = step.viewFile.absolutePathUri || 'File';
@@ -366,6 +495,16 @@ export class AntigravityBrowserClient {
               toolType: 'edit',
               label: `Edit: ${step.codeAction.uri}`,
               diff: step.codeAction.diff
+            });
+          } else if (step.notifyUser) {
+            currentAssistant.steps.push({
+              stepIndex: idx,
+              type: 'notifyUser',
+              content: step.notifyUser.notificationContent || '',
+              reviewUris: step.notifyUser.reviewAbsoluteUris || [],
+              isBlocking: Boolean(step.notifyUser.isBlocking),
+              askForUserFeedback: Boolean(step.notifyUser.askForUserFeedback),
+              confidence: step.notifyUser.confidenceScore || null
             });
           } else if (step.searchWeb) {
             currentAssistant.steps.push({
@@ -391,36 +530,92 @@ export class AntigravityBrowserClient {
     return turns.filter(t => t.role === 'user' || (t.steps && t.steps.length > 0));
   }
 
-  // 9. Send User Prompt Message
-  async sendMessage({ cascadeId, text, modelEnum, thinkingBudget = 8192, autoExecute = true }) {
+  // 8. Update User Settings on daemon and global config.json
+  async setUserSettings(autoExecutionPolicy) {
     if (!this.csrfToken) await this.initCsrfToken();
+    try {
+      // Official Jetbox API for persistent user settings
+      await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/JetboxWriteState`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({
+          userConfig: {
+            userSettings: {
+              enableTerminalSandbox: false,
+              autoExecutionPolicy: autoExecutionPolicy
+            }
+          }
+        })
+      });
+    } catch (err) {
+      console.warn('JetboxWriteState error:', err);
+    }
+
+    try {
+      await fetch('/api/sync-policy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ policy: autoExecutionPolicy })
+      });
+    } catch (err) {
+      console.warn('Config sync warning:', err);
+    }
+  }
+
+  // 9. Send User Prompt Message
+  async sendMessage({
+    cascadeId,
+    text,
+    modelEnum,
+    thinkingBudget = 8192,
+    autoExecutionPolicy = 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER',
+    autoExecute
+  }) {
+    if (!this.csrfToken) await this.initCsrfToken();
+
+    // Support enum string, alias ('EAGER', 'AUTO', 'OFF'), or boolean autoExecute
+    let policy = autoExecutionPolicy;
+    if (autoExecute !== undefined && (!autoExecutionPolicy || autoExecutionPolicy === 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER')) {
+      policy = autoExecute ? 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER' : 'CASCADE_COMMANDS_AUTO_EXECUTION_OFF';
+    }
+    if (policy === 'EAGER') policy = 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER';
+    else if (policy === 'AUTO') policy = 'CASCADE_COMMANDS_AUTO_EXECUTION_AUTO';
+    else if (policy === 'OFF') policy = 'CASCADE_COMMANDS_AUTO_EXECUTION_OFF';
+
     const payload = {
       cascadeId,
       items: [{ text }],
       cascadeConfig: {
         plannerConfig: {
-          requestedModel: { model: modelEnum },
-          supportsThinking: thinkingBudget > 0,
-          thinkingBudget,
-          supportsLatexRendering: true,
-          useAiCredits: false,
           toolConfig: {
             runCommand: {
               autoCommandConfig: {
-                autoExecutionPolicy: autoExecute
-                  ? 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER'
-                  : 'CASCADE_COMMANDS_AUTO_EXECUTION_ASK_USER'
+                autoExecutionPolicy: policy
               }
             },
             notifyUser: {}
           },
-          knowledgeConfig: {}
+          requestedModel: {
+            model: modelEnum || 'MODEL_PLACEHOLDER_M319'
+          },
+          supportsThinking: Number(thinkingBudget) > 0,
+          thinkingBudget: Number(thinkingBudget) || 0,
+          knowledgeConfig: {},
+          useAiCredits: false,
+          supportsLatexRendering: true
         },
-        executorConfig: { useCoreDirect: true },
+        executorConfig: {
+          useCoreDirect: true
+        },
         conversationHistoryConfig: {}
       },
       customAgentSpec: {
-        builtinAgent: { defaultAgent: { isGoogle: false, isInteractive: true } }
+        builtinAgent: {
+          defaultAgent: {
+            isGoogle: false,
+            isInteractive: true
+          }
+        }
       },
       deliveryStrategy: 'MESSAGE_DELIVERY_STRATEGY_WHEN_IDLE'
     };
@@ -430,7 +625,7 @@ export class AntigravityBrowserClient {
       headers: this.getHeaders(),
       body: this.encodeFrame(payload)
     });
-    if (!res.ok) throw new Error(`SendUserCascadeMessage failed: ${res.status}`);
+    this.checkResponse(res);
     return res;
   }
 
@@ -450,125 +645,187 @@ export class AntigravityBrowserClient {
       }),
       signal: abortSignal
     });
-    if (!res.ok) throw new Error(`StreamAgentStateUpdates failed: ${res.status}`);
+    this.checkResponse(res);
 
     const stepResponseOffsets = new Map();
     const stepThinkingOffsets = new Map();
     const seenToolSteps = new Set();
-    let hasSeenRunningState = false;
-
-    await this.parseStream(res.body, (chunk) => {
-      const update = chunk.update;
-      const status = update?.status || update?.executableStatus || update?.executorLoopStatus || '';
-      
-      if (status.includes('RUNNING')) {
-        hasSeenRunningState = true;
-      }
-
-      const steps = update?.mainTrajectoryUpdate?.stepsUpdate?.steps || [];
-      const indices = update?.mainTrajectoryUpdate?.stepsUpdate?.indices || [];
-
-      for (let i = 0; i < steps.length; i++) {
-        const stepIndex = indices[i] !== undefined ? indices[i] : i;
-        
-        // CRITICAL: Skip all steps belonging to previous turns
-        if (stepIndex < startStepIndex) continue;
-
-        const step = steps[i];
-
-        // 1. Thinking
-        if (step.plannerResponse?.thinking) {
-          const full = step.plannerResponse.thinking;
-          const prev = stepThinkingOffsets.get(stepIndex) || 0;
-          if (full.length > prev) {
-            const delta = full.slice(prev);
-            stepThinkingOffsets.set(stepIndex, full.length);
-            onUpdate({ type: 'thinking', delta, full, stepIndex });
-          }
-        }
-
-        // 2. Response content
-        if (step.plannerResponse?.response) {
-          const full = step.plannerResponse.response;
-          const prev = stepResponseOffsets.get(stepIndex) || 0;
-          if (full.length > prev) {
-            const delta = full.slice(prev);
-            stepResponseOffsets.set(stepIndex, full.length);
-            onUpdate({ type: 'content', delta, full, stepIndex });
-          }
-        }
-
-        // 3. Tools (Deduplicated per stepIndex)
-        if (step.runCommand) {
-          const cmd = step.runCommand.commandLine || step.runCommand.proposedCommandLine;
-          const out = step.runCommand.combinedOutput?.full || step.runCommand.output || '';
-          if (!seenToolSteps.has(`cmd-${stepIndex}`)) {
-            seenToolSteps.add(`cmd-${stepIndex}`);
-            onUpdate({
-              type: 'tool',
-              toolType: 'command',
-              command: cmd,
-              output: out,
-              stepIndex
-            });
-          } else {
-            onUpdate({
-              type: 'tool_output',
-              output: out,
-              stepIndex
-            });
-          }
-        }
-
-        if (step.viewFile && !seenToolSteps.has(`read-${stepIndex}`)) {
-          seenToolSteps.add(`read-${stepIndex}`);
-          onUpdate({
-            type: 'tool',
-            toolType: 'read',
-            label: `Read: ${step.viewFile.absolutePathUri}`,
-            file: step.viewFile.absolutePathUri,
-            stepIndex
-          });
-        }
-
-        if (step.codeAction && !seenToolSteps.has(`edit-${stepIndex}`)) {
-          seenToolSteps.add(`edit-${stepIndex}`);
-          onUpdate({
-            type: 'tool',
-            toolType: 'edit',
-            label: `Edit: ${step.codeAction.uri}`,
-            diff: step.codeAction.diff,
-            stepIndex
-          });
-        }
-
-        if (step.searchWeb) {
-          const query = step.searchWeb.query || '';
-          const summary = step.searchWeb.summary || '';
-          if (!seenToolSteps.has(`search-${stepIndex}`)) {
-            seenToolSteps.add(`search-${stepIndex}`);
-            onUpdate({
-              type: 'tool',
-              toolType: 'search',
-              label: `Web Search: ${query}`,
-              query,
-              output: summary,
-              stepIndex
-            });
-          } else if (summary) {
-            onUpdate({
-              type: 'tool_output',
-              output: summary,
-              stepIndex
-            });
-          }
-        }
-      }
-
-      if (hasSeenRunningState && (status === 'CASCADE_RUN_STATUS_IDLE' || status.includes('IDLE'))) {
+    let isDone = false;
+    const markDone = () => {
+      if (!isDone) {
+        isDone = true;
         onUpdate({ type: 'done' });
       }
-    });
+    };
+
+    try {
+      await this.parseStream(res.body, (chunk) => {
+        const update = chunk.update;
+        const status = update?.status || update?.executableStatus || update?.executorLoopStatus || '';
+
+        const steps = update?.mainTrajectoryUpdate?.stepsUpdate?.steps || [];
+        const indices = update?.mainTrajectoryUpdate?.stepsUpdate?.indices || [];
+
+        for (let i = 0; i < steps.length; i++) {
+          const step = steps[i];
+          const stepInfo = step.metadata?.sourceTrajectoryStepInfo;
+          const stepIndex = (stepInfo?.stepIndex !== undefined)
+            ? stepInfo.stepIndex
+            : (indices[i] !== undefined ? indices[i] : (startStepIndex + i));
+          const trajectoryId = stepInfo?.trajectoryId || cascadeId;
+          
+          // CRITICAL: Skip all steps belonging to previous turns
+          if (stepIndex < startStepIndex) continue;
+
+          // 1. Thinking
+          if (step.plannerResponse?.thinking) {
+            const full = step.plannerResponse.thinking;
+            const prev = stepThinkingOffsets.get(stepIndex) || 0;
+            if (full.length > prev) {
+              const delta = full.slice(prev);
+              stepThinkingOffsets.set(stepIndex, full.length);
+              onUpdate({ type: 'thinking', delta, full, stepIndex });
+            }
+          }
+
+          // 2. Response content
+          if (step.plannerResponse?.response) {
+            const full = step.plannerResponse.response;
+            const prev = stepResponseOffsets.get(stepIndex) || 0;
+            if (full.length > prev) {
+              const delta = full.slice(prev);
+              stepResponseOffsets.set(stepIndex, full.length);
+              onUpdate({ type: 'content', delta, full, stepIndex });
+            }
+          }
+
+          // 3a. Generic / Permission Interaction Command awaiting approval
+          if (step.requestedInteraction?.permission || (step.generic?.args?.CommandLine && !step.runCommand)) {
+            const cmd = step.generic?.args?.CommandLine || step.requestedInteraction?.permission?.resource?.target || '';
+            const isWaiting = step.status === 'CORTEX_STEP_STATUS_WAITING' || Boolean(step.requestedInteraction?.permission);
+            if (!seenToolSteps.has(`cmd-${stepIndex}`)) {
+              seenToolSteps.add(`cmd-${stepIndex}`);
+              onUpdate({
+                type: 'tool',
+                toolType: 'command',
+                command: cmd,
+                output: '',
+                status: step.status || 'CORTEX_STEP_STATUS_WAITING',
+                isWaiting,
+                isProposed: true,
+                stepIndex,
+                trajectoryId
+              });
+            }
+          }
+
+          // 3b. Standard Run Command tool (Deduplicated per stepIndex)
+          if (step.runCommand) {
+            const cmd = step.runCommand.commandLine || step.runCommand.proposedCommandLine;
+            const out = step.runCommand.combinedOutput?.full || step.runCommand.output || '';
+            const status = step.status;
+            const isWaiting = status === 'CORTEX_STEP_STATUS_WAITING';
+            const isProposed = isWaiting || Boolean(step.runCommand.proposedCommandLine && !step.runCommand.commandLine && !out);
+            const err = step.error?.shortError || step.error?.message;
+
+            // Skip emitting internal sandbox connection failures that are retried locally
+            if (err && err.includes('sandbox') && !out) {
+              continue;
+            }
+
+            if (!seenToolSteps.has(`cmd-${stepIndex}`)) {
+              seenToolSteps.add(`cmd-${stepIndex}`);
+              onUpdate({
+                type: 'tool',
+                toolType: 'command',
+                command: cmd,
+                output: out,
+                status,
+                isWaiting,
+                isProposed,
+                error: err,
+                stepIndex,
+                trajectoryId
+              });
+            } else {
+              onUpdate({
+                type: 'tool_output',
+                output: out,
+                status,
+                isWaiting,
+                isProposed,
+                error: err,
+                stepIndex,
+                trajectoryId
+              });
+            }
+          }
+
+          if (step.viewFile && !seenToolSteps.has(`read-${stepIndex}`)) {
+            seenToolSteps.add(`read-${stepIndex}`);
+            onUpdate({
+              type: 'tool',
+              toolType: 'read',
+              label: `Read: ${step.viewFile.absolutePathUri}`,
+              file: step.viewFile.absolutePathUri,
+              stepIndex
+            });
+          }
+
+          if (step.codeAction && !seenToolSteps.has(`edit-${stepIndex}`)) {
+            seenToolSteps.add(`edit-${stepIndex}`);
+            onUpdate({
+              type: 'tool',
+              toolType: 'edit',
+              label: `Edit: ${step.codeAction.uri}`,
+              diff: step.codeAction.diff,
+              stepIndex
+            });
+          }
+
+          if (step.notifyUser && !seenToolSteps.has(`notify-${stepIndex}`)) {
+            seenToolSteps.add(`notify-${stepIndex}`);
+            onUpdate({
+              type: 'notify_user',
+              stepIndex,
+              content: step.notifyUser.notificationContent || '',
+              reviewUris: step.notifyUser.reviewAbsoluteUris || [],
+              isBlocking: Boolean(step.notifyUser.isBlocking),
+              askForUserFeedback: Boolean(step.notifyUser.askForUserFeedback),
+              confidence: step.notifyUser.confidenceScore || null
+            });
+          }
+
+          if (step.searchWeb) {
+            const query = step.searchWeb.query || '';
+            const summary = step.searchWeb.summary || '';
+            if (!seenToolSteps.has(`search-${stepIndex}`)) {
+              seenToolSteps.add(`search-${stepIndex}`);
+              onUpdate({
+                type: 'tool',
+                toolType: 'search',
+                label: `Web Search: ${query}`,
+                query,
+                output: summary,
+                stepIndex
+              });
+            } else if (summary) {
+              onUpdate({
+                type: 'tool_output',
+                output: summary,
+                stepIndex
+              });
+            }
+          }
+        }
+
+        if (status === 'CASCADE_RUN_STATUS_IDLE' || status.includes('IDLE') || status.includes('COMPLETED') || status === 'CORTEX_EXECUTABLE_STATUS_COMPLETED') {
+          markDone();
+        }
+      });
+    } finally {
+      markDone();
+    }
   }
 
   // 11. Stop execution

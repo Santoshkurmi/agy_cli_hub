@@ -18,11 +18,37 @@ import {
   Folder,
   FolderGit2,
   Check,
-  X
+  X,
+  Lock,
+  Bell,
+  Play,
+  Loader2,
+  AlertCircle,
+  ShieldCheck,
+  CheckCircle2,
+  Info
 } from 'lucide-react';
 import { AntigravityBrowserClient } from './agyClient';
 
 const client = new AntigravityBrowserClient('http://127.0.0.1:8090');
+
+const getSavedWorkspaces = () => {
+  try {
+    return JSON.parse(localStorage.getItem('agy_session_workspaces') || '{}');
+  } catch {
+    return {};
+  }
+};
+
+const saveSessionWorkspace = (sessionId, path, projId) => {
+  try {
+    const saved = getSavedWorkspaces();
+    saved[sessionId] = { workspaceDir: path, projectId: projId };
+    localStorage.setItem('agy_session_workspaces', JSON.stringify(saved));
+  } catch (e) {
+    console.warn('Failed to save session workspace:', e);
+  }
+};
 
 export default function App() {
   const [hubUrl, setHubUrl] = useState('http://127.0.0.1:8090');
@@ -32,14 +58,16 @@ export default function App() {
   const [models, setModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState('');
   const [thinkingBudget, setThinkingBudget] = useState(8192);
-  const [autoExecute, setAutoExecute] = useState(true);
+  const [autoExecutionPolicy, setAutoExecutionPolicy] = useState(() => {
+    return localStorage.getItem('agy_auto_exec_policy') || 'EAGER';
+  });
 
   // Projects and Workspace Folders
   const [projects, setProjects] = useState([]);
   const [selectedProjectId, setSelectedProjectId] = useState('default-cli-project');
   const [workspaceDir, setWorkspaceDir] = useState('/home/cat/agy_cli_hub');
   const [showProjectModal, setShowProjectModal] = useState(false);
-  const [modalMode, setModalMode] = useState('new'); // 'new' | 'switch'
+  const [modalMode, setModalMode] = useState('new');
   const [tempCustomPath, setTempCustomPath] = useState('/home/cat/agy_cli_hub');
   const [tempSelectedProjectId, setTempSelectedProjectId] = useState('default-cli-project');
 
@@ -49,6 +77,21 @@ export default function App() {
   const [collapsedThinking, setCollapsedThinking] = useState({});
   const [collapsedTools, setCollapsedTools] = useState({});
   const [showConfig, setShowConfig] = useState(false);
+
+  // Global Toast Notifications
+  const [toasts, setToasts] = useState([]);
+
+  const showToast = (message, type = 'error') => {
+    const id = Date.now() + Math.random().toString(36).slice(2, 6);
+    setToasts(prev => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      setToasts(prev => prev.filter(t => t.id !== id));
+    }, 4500);
+  };
+
+  const removeToast = (id) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  };
 
   const messagesEndRef = useRef(null);
   const abortControllerRef = useRef(null);
@@ -109,18 +152,12 @@ export default function App() {
     } catch (err) {
       console.warn('[UI] Connect check failed:', err.message);
       setConnected(false);
+      showToast(`Daemon connection failed: ${err.message}`, 'error');
     }
   };
 
   const openNewSessionModal = () => {
     setModalMode('new');
-    setTempCustomPath(workspaceDir || '/home/cat/agy_cli_hub');
-    setTempSelectedProjectId(selectedProjectId || 'default-cli-project');
-    setShowProjectModal(true);
-  };
-
-  const openSwitchProjectModal = () => {
-    setModalMode('switch');
     setTempCustomPath(workspaceDir || '/home/cat/agy_cli_hub');
     setTempSelectedProjectId(selectedProjectId || 'default-cli-project');
     setShowProjectModal(true);
@@ -136,41 +173,27 @@ export default function App() {
     const projObj = projects.find(p => p.id === finalProjId);
     const projName = projObj?.name || finalPath.split('/').filter(Boolean).pop() || 'Workspace';
 
-    if (modalMode === 'new') {
-      try {
-        const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
-        const cascadeId = await client.startConversation(modelToUse, finalPath, finalProjId);
-        const newChat = {
-          id: cascadeId,
-          title: `Session (${projName})`,
-          lastModified: new Date().toISOString(),
-          stepCount: 0,
-          workspaceDir: finalPath,
-          projectId: finalProjId
-        };
-        setConversations(prev => [newChat, ...prev]);
-        setActiveSessionId(cascadeId);
-        setMessages([
-          { role: 'system', content: `Workspace initialized: ${finalPath} [${projName}]` }
-        ]);
-      } catch (err) {
-        console.error('Failed to start session:', err);
-        alert(`Failed to start session: ${err.message}`);
-      }
-    } else if (modalMode === 'switch') {
-      if (activeSessionId) {
-        try {
-          const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
-          await client.setSessionWorkspace(activeSessionId, finalPath, finalProjId, modelToUse);
-          setMessages(prev => [
-            ...prev,
-            { role: 'system', content: `Workspace switched to: ${finalPath} (${projName})` }
-          ]);
-        } catch (err) {
-          console.error('Failed to update workspace:', err);
-          alert(`Failed to switch workspace: ${err.message}`);
-        }
-      }
+    try {
+      const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
+      const cascadeId = await client.startConversation(modelToUse, finalPath, finalProjId);
+      saveSessionWorkspace(cascadeId, finalPath, finalProjId);
+      const newChat = {
+        id: cascadeId,
+        title: `Session (${projName})`,
+        lastModified: new Date().toISOString(),
+        stepCount: 0,
+        workspaceDir: finalPath,
+        projectId: finalProjId
+      };
+      setConversations(prev => [newChat, ...prev]);
+      setActiveSessionId(cascadeId);
+      setMessages([
+        { role: 'system', content: `Workspace initialized: ${finalPath} [${projName}]` }
+      ]);
+      showToast(`Session created in ${projName}`, 'success');
+    } catch (err) {
+      console.error('Failed to start session:', err);
+      showToast(`Failed to start session: ${err.message}`, 'error');
     }
   };
 
@@ -180,11 +203,72 @@ export default function App() {
     }
     setActiveSessionId(id);
     setIsGenerating(false);
+
+    const targetConv = conversations.find(c => c.id === id);
+    const saved = getSavedWorkspaces();
+    const path = targetConv?.workspaceDir || saved[id]?.workspaceDir;
+    const proj = targetConv?.projectId || saved[id]?.projectId;
+    if (path) setWorkspaceDir(path);
+    if (proj) setSelectedProjectId(proj);
+
     try {
       const steps = await client.getConversationHistory(id);
       setMessages(steps);
     } catch (err) {
       console.error('Failed to load history:', err);
+      showToast(`Failed to load history: ${err.message}`, 'error');
+    }
+  };
+
+  const handleApproveCommand = async (stepIndex, scope = 'PERMISSION_SCOPE_ONCE') => {
+    if (!activeSessionId) return;
+    try {
+      const step = messages.flatMap(m => m.steps || []).find(s => s.stepIndex === stepIndex);
+      const trajectoryId = step?.trajectoryId;
+      await client.handleCascadeUserInteraction(activeSessionId, stepIndex, trajectoryId, true, scope);
+      const scopeLabel = scope === 'PERMISSION_SCOPE_ONCE' ? 'Run Once'
+        : scope === 'PERMISSION_SCOPE_CONVERSATION' ? 'Always in Chat'
+        : 'Always in Workspace';
+      showToast(`Command approved: ${scopeLabel}`, 'success');
+    } catch (err) {
+      console.warn('handleCascadeUserInteraction approval failed, trying fallback:', err);
+      try {
+        await client.resolveOutstandingSteps(activeSessionId);
+        showToast('Command approved via fallback', 'success');
+      } catch (fallbackErr) {
+        console.error('Failed to approve command:', fallbackErr);
+        showToast(`Approval failed: ${fallbackErr.message}`, 'error');
+      }
+    }
+  };
+
+  const handleCancelStep = async (stepIndex) => {
+    if (!activeSessionId) return;
+    try {
+      const step = messages.flatMap(m => m.steps || []).find(s => s.stepIndex === stepIndex);
+      const trajectoryId = step?.trajectoryId;
+      await client.handleCascadeUserInteraction(activeSessionId, stepIndex, trajectoryId, false, undefined, 'User canceled this command.');
+      showToast('Command canceled by user', 'info');
+    } catch (err) {
+      console.warn('handleCascadeUserInteraction cancel failed, trying fallback:', err);
+      try {
+        await client.cancelCascadeSteps(activeSessionId, [stepIndex]);
+        showToast('Command canceled', 'info');
+      } catch (fallbackErr) {
+        console.error('Failed to cancel step:', fallbackErr);
+        showToast(`Cancel failed: ${fallbackErr.message}`, 'error');
+      }
+    }
+  };
+
+  const handleResolvePlan = async () => {
+    if (!activeSessionId) return;
+    try {
+      await client.resolveOutstandingSteps(activeSessionId);
+      showToast('Plan approved and proceeding', 'success');
+    } catch (err) {
+      console.error('Failed to proceed:', err);
+      showToast(`Failed to proceed: ${err.message}`, 'error');
     }
   };
 
@@ -196,18 +280,25 @@ export default function App() {
 
     let targetSessionId = activeSessionId;
     if (!targetSessionId) {
-      targetSessionId = await client.startConversation(modelToUse, workspaceDir, selectedProjectId);
-      setActiveSessionId(targetSessionId);
-      const projObj = projects.find(p => p.id === selectedProjectId);
-      const projName = projObj?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace';
-      setConversations(prev => [{
-        id: targetSessionId,
-        title: inputPrompt.slice(0, 30),
-        lastModified: new Date().toISOString(),
-        stepCount: 1,
-        workspaceDir,
-        projectId: selectedProjectId
-      }, ...prev]);
+      try {
+        targetSessionId = await client.startConversation(modelToUse, workspaceDir, selectedProjectId);
+        setActiveSessionId(targetSessionId);
+        saveSessionWorkspace(targetSessionId, workspaceDir, selectedProjectId);
+        const projObj = projects.find(p => p.id === selectedProjectId);
+        const projName = projObj?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace';
+        setConversations(prev => [{
+          id: targetSessionId,
+          title: inputPrompt.slice(0, 30),
+          lastModified: new Date().toISOString(),
+          stepCount: 1,
+          workspaceDir,
+          projectId: selectedProjectId
+        }, ...prev]);
+      } catch (startErr) {
+        console.error('Failed to create session:', startErr);
+        alert(`Failed to create session: ${startErr.message}`);
+        return;
+      }
     }
 
     const currentPrompt = inputPrompt;
@@ -226,13 +317,13 @@ export default function App() {
     setIsGenerating(true);
 
     try {
-      // 3. Send User Cascade Message directly
+      // 3. Send User Cascade Message directly with execution policy
       await client.sendMessage({
         cascadeId: targetSessionId,
         text: currentPrompt,
         modelEnum: modelToUse,
         thinkingBudget: parseInt(thinkingBudget, 10),
-        autoExecute
+        autoExecutionPolicy
       });
 
       // 4. Stream Agent Updates starting strictly after startStepIndex
@@ -242,7 +333,17 @@ export default function App() {
       await client.streamUpdates(targetSessionId, (update) => {
         if (update.type === 'done') {
           setIsGenerating(false);
-          client.listConversations().then(setConversations);
+          client.listConversations().then(remoteList => {
+            const saved = getSavedWorkspaces();
+            setConversations(prev => remoteList.map(remote => {
+              const existing = prev.find(p => p.id === remote.id);
+              return {
+                ...remote,
+                workspaceDir: existing?.workspaceDir || saved[remote.id]?.workspaceDir || '/home/cat/agy_cli_hub',
+                projectId: existing?.projectId || saved[remote.id]?.projectId || 'default-cli-project'
+              };
+            }));
+          });
           return;
         }
 
@@ -257,23 +358,33 @@ export default function App() {
           let stepObj = last.steps.find(s => s.stepIndex === update.stepIndex);
 
           if (update.type === 'thinking') {
-            if (!stepObj) {
-              stepObj = { stepIndex: update.stepIndex, type: 'planner', thinking: update.delta, content: '' };
-              last.steps.push(stepObj);
+            const thinkingText = update.full !== undefined ? update.full : ((stepObj?.thinking || '') + (update.delta || ''));
+            let thinkStep = last.steps.find(s => s.type === 'planner' && (s.stepIndex === update.stepIndex || (s.thinking && !s.content)));
+            if (!thinkStep) {
+              thinkStep = { stepIndex: update.stepIndex, type: 'planner', thinking: thinkingText, content: '' };
+              last.steps.push(thinkStep);
             } else {
-              const sIdx = last.steps.indexOf(stepObj);
-              last.steps[sIdx] = { ...stepObj, thinking: (stepObj.thinking || '') + update.delta };
+              const sIdx = last.steps.indexOf(thinkStep);
+              last.steps[sIdx] = { ...thinkStep, stepIndex: update.stepIndex, thinking: thinkingText };
             }
           } else if (update.type === 'content') {
-            if (!stepObj) {
-              stepObj = { stepIndex: update.stepIndex, type: 'planner', thinking: '', content: update.delta };
-              last.steps.push(stepObj);
+            const contentText = update.full !== undefined ? update.full : ((stepObj?.content || '') + (update.delta || ''));
+            let contentStep = last.steps.find(s => s.type === 'planner' && (s.stepIndex === update.stepIndex || Boolean(s.content)));
+            if (!contentStep) {
+              contentStep = { stepIndex: update.stepIndex, type: 'planner', thinking: '', content: contentText };
+              last.steps.push(contentStep);
             } else {
-              const sIdx = last.steps.indexOf(stepObj);
-              last.steps[sIdx] = { ...stepObj, content: (stepObj.content || '') + update.delta };
+              const sIdx = last.steps.indexOf(contentStep);
+              last.steps[sIdx] = { ...contentStep, stepIndex: update.stepIndex, content: contentText };
             }
           } else if (update.type === 'tool') {
-            if (!stepObj) {
+            // Replace previous empty or waiting instance of same command if any
+            const prevRetryIdx = (update.toolType === 'command' && update.command)
+              ? last.steps.findIndex(s => s.toolType === 'command' && s.command === update.command && (!s.output || s.isWaiting || s.isProposed))
+              : -1;
+            if (prevRetryIdx !== -1) {
+              last.steps[prevRetryIdx] = { ...last.steps[prevRetryIdx], ...update };
+            } else if (!stepObj) {
               stepObj = { stepIndex: update.stepIndex, ...update };
               last.steps.push(stepObj);
             } else {
@@ -281,9 +392,39 @@ export default function App() {
               last.steps[sIdx] = { ...stepObj, ...update };
             }
           } else if (update.type === 'tool_output') {
-            if (stepObj) {
+            const targetStep = stepObj || (update.command ? last.steps.find(s => s.toolType === 'command' && s.command === update.command) : null) || last.steps.slice().reverse().find(s => s.toolType === 'command');
+            if (targetStep) {
+              const sIdx = last.steps.indexOf(targetStep);
+              last.steps[sIdx] = {
+                ...targetStep,
+                output: update.output,
+                isProposed: update.isProposed,
+                status: update.status,
+                isWaiting: update.isWaiting,
+                error: update.error
+              };
+            }
+          } else if (update.type === 'notify_user') {
+            if (!stepObj) {
+              stepObj = {
+                stepIndex: update.stepIndex,
+                type: 'notifyUser',
+                content: update.content,
+                reviewUris: update.reviewUris,
+                isBlocking: update.isBlocking,
+                askForUserFeedback: update.askForUserFeedback,
+                confidence: update.confidence
+              };
+              last.steps.push(stepObj);
+            } else {
               const sIdx = last.steps.indexOf(stepObj);
-              last.steps[sIdx] = { ...stepObj, output: update.output };
+              last.steps[sIdx] = {
+                ...stepObj,
+                type: 'notifyUser',
+                content: update.content,
+                reviewUris: update.reviewUris,
+                isBlocking: update.isBlocking
+              };
             }
           }
           return clone;
@@ -293,6 +434,24 @@ export default function App() {
     } catch (err) {
       if (err.name !== 'AbortError') {
         console.error('Chat execution error:', err);
+        setMessages(prev => {
+          const clone = [...prev];
+          const lastIdx = clone.length - 1;
+          if (lastIdx >= 0 && clone[lastIdx].role === 'assistant') {
+            clone[lastIdx] = {
+              ...clone[lastIdx],
+              steps: [
+                ...(clone[lastIdx].steps || []),
+                {
+                  stepIndex: 999999,
+                  type: 'error',
+                  content: `Failed to send message: ${err.message}`
+                }
+              ]
+            };
+          }
+          return clone;
+        });
       }
       setIsGenerating(false);
     }
@@ -372,20 +531,34 @@ export default function App() {
               <Settings size={12} style={{ marginLeft: 4 }} />
             </div>
 
-            {/* Project / Workspace Switcher Pill */}
+            {/* Project / Workspace Display Pill */}
             <div
-              className="project-pill"
-              onClick={openSwitchProjectModal}
-              title="Click to switch workspace folder or project (even mid-conversation)"
+              className={`project-pill ${activeSessionId ? 'locked' : ''}`}
+              onClick={() => {
+                if (!activeSessionId) openNewSessionModal();
+              }}
+              title={
+                activeSessionId
+                  ? 'Project workspace is locked to this active session. Click "+ New Session" to select another project folder.'
+                  : 'Click to select project folder for new session'
+              }
             >
-              <Folder size={14} color="#38bdf8" />
+              {activeSessionId ? (
+                <Lock size={13} color="#94a3b8" />
+              ) : (
+                <Folder size={14} color="#38bdf8" />
+              )}
               <span className="project-pill-title">
                 {projects.find(p => p.id === selectedProjectId)?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace'}
               </span>
               <span className="project-pill-path">
                 {workspaceDir ? workspaceDir.split('/').slice(-2).join('/') : ''}
               </span>
-              <ChevronDown size={12} color="#64748b" />
+              {activeSessionId ? (
+                <span className="pill-lock-tag">Locked</span>
+              ) : (
+                <ChevronDown size={12} color="#64748b" />
+              )}
             </div>
 
             {activeModelObj?.quotaFraction !== undefined && (
@@ -431,17 +604,28 @@ export default function App() {
               </div>
             </div>
 
-            {/* Auto Execute Policy Toggle */}
+            {/* Command Auto-Execution Policy */}
             <div className="control-group">
               <Terminal size={14} />
-              <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                <input
-                  type="checkbox"
-                  checked={autoExecute}
-                  onChange={(e) => setAutoExecute(e.target.checked)}
-                />
-                <span>Auto-Run Tools</span>
-              </label>
+              <span>Policy:</span>
+              <select
+                className="select-control"
+                value={autoExecutionPolicy}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setAutoExecutionPolicy(val);
+                  localStorage.setItem('agy_auto_exec_policy', val);
+                  const fullPolicy = val === 'EAGER' ? 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER'
+                    : val === 'AUTO' ? 'CASCADE_COMMANDS_AUTO_EXECUTION_AUTO'
+                    : 'CASCADE_COMMANDS_AUTO_EXECUTION_OFF';
+                  client.setUserSettings(fullPolicy);
+                }}
+                title="Command Auto-Execution Policy: Eager (auto-run everything), Auto (smart safety), Off (ask user every time)"
+              >
+                <option value="EAGER">⚡ Auto-Run (Eager)</option>
+                <option value="AUTO">🛡️ Smart Safety (Auto)</option>
+                <option value="OFF">✋ Ask User (Off)</option>
+              </select>
             </div>
           </div>
         </div>
@@ -489,6 +673,15 @@ export default function App() {
                   {/* Step-based execution stream (Thinking, Tools, and Content in chronological order) */}
                   {msg.steps && msg.steps.length > 0 ? (
                     msg.steps.map((step, sIdx) => {
+                      if (step.type === 'error') {
+                        return (
+                          <div key={sIdx} className="error-card" style={{ padding: '10px 14px', borderRadius: '8px', background: 'rgba(239, 68, 68, 0.12)', border: '1px solid rgba(239, 68, 68, 0.3)', color: '#f87171', fontSize: '13px', margin: '6px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <AlertCircle size={16} />
+                            <span>{step.content}</span>
+                          </div>
+                        );
+                      }
+
                       if (step.type === 'planner') {
                         const thinkKey = `${idx}-${step.stepIndex}`;
                         return (
@@ -517,6 +710,16 @@ export default function App() {
                       if (step.type === 'tool') {
                         const toolKey = `${idx}-${step.stepIndex}`;
                         const isCollapsed = collapsedTools[toolKey];
+                        // True approval required ONLY if step is specifically waiting on user OR proposed in OFF mode with no output
+                        const isAwaitingApproval = !step.output && !step.error && (
+                          step.status === 'CORTEX_STEP_STATUS_WAITING' ||
+                          step.isWaiting ||
+                          (step.isProposed && autoExecutionPolicy === 'OFF' && step.status !== 'CORTEX_STEP_STATUS_RUNNING')
+                        );
+                        const isRunning = !step.output && !step.error && !isAwaitingApproval && (
+                          step.status === 'CORTEX_STEP_STATUS_RUNNING' ||
+                          (isGenerating && sIdx === (msg.steps || []).length - 1 && step.status !== 'CORTEX_STEP_STATUS_ERROR' && step.status !== 'CORTEX_STEP_STATUS_DONE')
+                        );
                         return (
                           <div key={sIdx} className="tool-box">
                             <div
@@ -532,7 +735,7 @@ export default function App() {
                                 {step.toolType !== 'command' && step.toolType !== 'read' && step.toolType !== 'edit' && step.toolType !== 'search' && <Terminal size={14} />}
                                 <span>{step.label || (step.command ? `Terminal: ${step.command}` : 'Tool Execution')}</span>
                               </div>
-                              {(step.output || step.diff) && (
+                              {(step.output || step.diff || step.error) && (
                                 <span style={{ color: '#64748b' }}>
                                   {isCollapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
                                 </span>
@@ -546,7 +749,105 @@ export default function App() {
                                 {step.diff && (
                                   <div className="tool-content">{step.diff}</div>
                                 )}
+                                {step.error && !step.output && (
+                                  <div className="tool-content" style={{ color: '#ef4444' }}>{step.error}</div>
+                                )}
+                                {step.toolType === 'command' && isRunning && (
+                                  <div style={{ padding: '8px 12px', fontSize: '12px', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <Loader2 size={12} className="spin" /> Executing command in workspace...
+                                  </div>
+                                )}
+                                {step.toolType === 'command' && isAwaitingApproval && (
+                                  <div className="command-action-bar">
+                                    <span className="approval-badge">
+                                      <Terminal size={12} /> Execution approval required
+                                    </span>
+                                    <div className="action-buttons">
+                                      <button
+                                        type="button"
+                                        className="btn-approve"
+                                        onClick={() => handleApproveCommand(step.stepIndex, 'PERMISSION_SCOPE_ONCE')}
+                                        title="Execute this command once"
+                                      >
+                                        <Play size={12} /> Run Once
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="btn-approve-conversation"
+                                        onClick={() => handleApproveCommand(step.stepIndex, 'PERMISSION_SCOPE_CONVERSATION')}
+                                        title="Always allow this command in this conversation"
+                                      >
+                                        <Check size={12} /> Always in Chat
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="btn-approve-workspace"
+                                        onClick={() => handleApproveCommand(step.stepIndex, 'PERMISSION_SCOPE_WORKSPACE')}
+                                        title="Always allow this command in this workspace"
+                                      >
+                                        <ShieldCheck size={12} /> Always in Workspace
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="btn-reject"
+                                        onClick={() => handleCancelStep(step.stepIndex)}
+                                        title="Cancel this command"
+                                      >
+                                        <X size={12} /> Cancel
+                                      </button>
+                                    </div>
+                                  </div>
+                                )}
                               </>
+                            )}
+                          </div>
+                        );
+                      }
+
+                      if (step.type === 'notifyUser') {
+                        return (
+                          <div key={sIdx} className={`notify-user-card ${step.isBlocking ? 'blocking' : ''}`}>
+                            <div className="notify-user-header">
+                              <div className="notify-user-title">
+                                <Bell size={16} color={step.isBlocking ? '#f59e0b' : '#38bdf8'} />
+                                <span>{step.isBlocking ? 'Action Required: Plan Review & Feedback' : 'Agent Notification'}</span>
+                              </div>
+                              {step.isBlocking ? (
+                                <span className="blocking-tag">⏸️ Review Required</span>
+                              ) : (
+                                <span className="notice-tag">ℹ️ Notice</span>
+                              )}
+                            </div>
+
+                            {step.content && (
+                              <div className="notify-user-content">{step.content}</div>
+                            )}
+
+                            {step.reviewUris && step.reviewUris.length > 0 && (
+                              <div className="notify-uris-list">
+                                <span className="uris-label">Artifacts / Files to Review:</span>
+                                <div className="uris-chips">
+                                  {step.reviewUris.map((uri, uIdx) => (
+                                    <span key={uIdx} className="uri-chip" title={uri}>
+                                      <FileText size={12} />
+                                      {uri.split('/').filter(Boolean).pop() || uri}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {step.isBlocking && (
+                              <div className="notify-actions-bar">
+                                <button
+                                  type="button"
+                                  className="btn-proceed"
+                                  onClick={handleResolvePlan}
+                                >
+                                  <Check size={14} /> Proceed with Plan
+                                </button>
+                                <span className="notify-hint">Or send a reply below with suggestions</span>
+                              </div>
                             )}
                           </div>
                         );
@@ -733,6 +1034,21 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Toast Notification Container */}
+      <div className="toast-container">
+        {toasts.map(t => (
+          <div key={t.id} className={`toast-item ${t.type}`}>
+            {t.type === 'error' && <AlertCircle size={16} color="#ef4444" />}
+            {t.type === 'success' && <CheckCircle2 size={16} color="#10b981" />}
+            {t.type === 'info' && <Info size={16} color="#38bdf8" />}
+            <span style={{ flex: 1, wordBreak: 'break-word' }}>{t.message}</span>
+            <button type="button" className="toast-close" onClick={() => removeToast(t.id)}>
+              <X size={14} />
+            </button>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
