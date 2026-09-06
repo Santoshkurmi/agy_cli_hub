@@ -36,7 +36,10 @@ import {
   RotateCcw,
   Mic,
   MicOff,
-  Trash2
+  Trash2,
+  Paperclip,
+  Image as ImageIcon,
+  File
 } from 'lucide-react';
 import { AntigravityBrowserClient } from './agyClient';
 
@@ -68,6 +71,49 @@ function formatQuotaResetTime(isoString) {
   } catch (e) {
     return isoString;
   }
+}
+
+function formatFileSize(bytes) {
+  if (!bytes || bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
+function extractImageReferences(text) {
+  if (!text || typeof text !== 'string') return [];
+  const results = [];
+
+  // Markdown image syntax: ![alt](url_or_path)
+  const mdRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  let match;
+  while ((match = mdRegex.exec(text)) !== null) {
+    const p = match[2].trim();
+    if (!results.some(r => r.path === p)) {
+      results.push({ alt: match[1] || 'Generated image', path: p });
+    }
+  }
+
+  // Web image URLs: https://.../image.png
+  const urlRegex = /(https?:\/\/[^\s"')>]+\.(?:png|jpe?g|webp|gif|svg))/gi;
+  while ((match = urlRegex.exec(text)) !== null) {
+    const u = match[1].trim();
+    if (!results.some(r => r.path === u)) {
+      results.push({ alt: u.split('/').pop() || 'Image', path: u });
+    }
+  }
+
+  // Direct file paths (e.g. /home/cat/.../cow.png)
+  const pathRegex = /(?:^|\s|["'(])((?:file:\/\/|\/|\.\/)[^\s"')>]+\.(?:png|jpe?g|webp|gif|svg))(?:\b|["')]|$)/g;
+  while ((match = pathRegex.exec(text)) !== null) {
+    const p = match[1].trim();
+    if (!results.some(r => r.path === p)) {
+      results.push({ alt: p.split('/').pop() || 'Image', path: p });
+    }
+  }
+
+  return results;
 }
 
 const getSavedWorkspaces = () => {
@@ -149,6 +195,10 @@ export default function App() {
   const audioStreamRef = useRef(null);
   const recordingStartTimeRef = useRef(0);
   const recognitionRef = useRef(null);
+
+  // Multi-File & Image Upload States
+  const [attachedFiles, setAttachedFiles] = useState([]);
+  const fileInputRef = useRef(null);
 
   // Git VCS State
   const [vcsState, setVcsState] = useState(null);
@@ -348,6 +398,19 @@ export default function App() {
       ctrl.abort();
     };
   }, [workspaceDir]);
+
+  // Prevent browser from navigating away / opening images in full screen if dragged onto page
+  useEffect(() => {
+    const preventWindowDrop = (e) => {
+      e.preventDefault();
+    };
+    window.addEventListener('dragover', preventWindowDrop);
+    window.addEventListener('drop', preventWindowDrop);
+    return () => {
+      window.removeEventListener('dragover', preventWindowDrop);
+      window.removeEventListener('drop', preventWindowDrop);
+    };
+  }, []);
 
   // 3. Lazy-fetch slash commands (cached once on typing '/')
   const fetchSlashCommandsIfNeeded = useCallback(async () => {
@@ -598,6 +661,89 @@ export default function App() {
       return;
     }
     handleSendMessage(e);
+  };
+
+  // 7. Multi-File & Image Upload Handlers
+  const handleFilesSelected = (filesList) => {
+    if (!filesList || filesList.length === 0) return;
+    const filesArray = Array.from(filesList);
+
+    filesArray.forEach((file) => {
+      const isImg = file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|svg|bmp|ico|tiff?)$/i.test(file.name);
+      const fileId = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const previewUrl = isImg ? URL.createObjectURL(file) : null;
+
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64Content = (reader.result || '').split(',')[1] || '';
+        const isText = file.type.startsWith('text/') || /\.(txt|md|js|jsx|ts|tsx|json|html|css|py|sh|yaml|yml|log|csv)$/i.test(file.name);
+        if (isText) {
+          const textReader = new FileReader();
+          textReader.onloadend = () => {
+            setAttachedFiles(prev => [
+              ...prev,
+              {
+                id: fileId,
+                file,
+                name: file.name,
+                size: file.size,
+                sizeFormatted: formatFileSize(file.size),
+                type: file.type || (isImg ? 'image/png' : 'application/octet-stream'),
+                isImage: isImg,
+                previewUrl,
+                base64: base64Content,
+                textContent: textReader.result || ''
+              }
+            ]);
+          };
+          textReader.readAsText(file);
+        } else {
+          setAttachedFiles(prev => [
+            ...prev,
+            {
+              id: fileId,
+              file,
+              name: file.name,
+              size: file.size,
+              sizeFormatted: formatFileSize(file.size),
+              type: file.type || (isImg ? 'image/png' : 'application/octet-stream'),
+              isImage: isImg,
+              previewUrl,
+              base64: base64Content,
+              textContent: null
+            }
+          ]);
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const removeAttachedFile = (id) => {
+    setAttachedFiles(prev => {
+      const target = prev.find(f => f.id === id);
+      if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter(f => f.id !== id);
+    });
+  };
+
+  const handlePaste = (e) => {
+    if (e.clipboardData && e.clipboardData.files && e.clipboardData.files.length > 0) {
+      handleFilesSelected(e.clipboardData.files);
+    }
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleFilesSelected(e.dataTransfer.files);
+    }
   };
 
   // Slash Command Input Handlers
@@ -1090,6 +1236,7 @@ export default function App() {
     e?.preventDefault();
 
     let currentAudio = attachedAudio;
+    let currentFiles = attachedFiles;
 
     // If recording voice, stop audio recorder
     if (isRecording) {
@@ -1098,10 +1245,11 @@ export default function App() {
 
     const currentPrompt = inputPrompt;
 
-    if ((!currentPrompt.trim() && !currentAudio) || isGenerating) return;
+    if ((!currentPrompt.trim() && !currentAudio && currentFiles.length === 0) || isGenerating) return;
 
     setInputPrompt('');
     setAttachedAudio(null);
+    setAttachedFiles([]);
 
     const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
 
@@ -1113,7 +1261,7 @@ export default function App() {
         saveSessionWorkspace(targetSessionId, workspaceDir, selectedProjectId);
         const projObj = projects.find(p => p.id === selectedProjectId);
         const projName = projObj?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace';
-        const sessionTitle = currentPrompt.slice(0, 30) || (currentAudio ? `Voice Note (${currentAudio.durationFormatted})` : 'New Session');
+        const sessionTitle = currentPrompt.slice(0, 30) || (currentAudio ? `Voice Note (${currentAudio.durationFormatted})` : (currentFiles.length > 0 ? `Files (${currentFiles.length})` : 'New Session'));
         setConversations(prev => [{
           id: targetSessionId,
           title: sessionTitle,
@@ -1146,7 +1294,8 @@ export default function App() {
       {
         role: 'user',
         content: currentPrompt,
-        audio: currentAudio
+        audio: currentAudio,
+        files: currentFiles
       },
       { role: 'assistant', steps: [] }
     ]);
@@ -1154,20 +1303,41 @@ export default function App() {
     setIsGenerating(true);
 
     try {
-      const mediaPayload = currentAudio ? [{
+      const imagePayload = currentFiles.filter(f => f.isImage).map(f => ({ value: f.base64 }));
+      const fileMediaPayload = currentFiles.map(f => ({
+        mimeType: f.type || 'application/octet-stream',
+        inlineData: f.base64,
+        description: f.name
+      }));
+      const audioMediaPayload = currentAudio ? [{
         mimeType: currentAudio.mimeType || 'audio/webm',
         inlineData: currentAudio.base64,
         durationSeconds: currentAudio.duration || 0,
         description: currentAudio.transcription || 'Voice note'
       }] : [];
+      const allMedia = [...audioMediaPayload, ...fileMediaPayload];
+
+      // For text and code files, append formatted code blocks to actualText so the LLM gets full text access
+      let textToSend = actualText;
+      const textDocs = currentFiles.filter(f => f.textContent);
+      if (textDocs.length > 0) {
+        const docSnippets = textDocs.map(f => `\n[Attached File: ${f.name}]\n\`\`\`\n${f.textContent}\n\`\`\``).join('\n');
+        textToSend = textToSend ? `${textToSend}\n\n${docSnippets}` : docSnippets;
+      }
+      if (!textToSend && currentAudio) {
+        textToSend = currentAudio.transcription ? `Voice message: "${currentAudio.transcription}"` : 'Voice message';
+      } else if (!textToSend && currentFiles.length > 0) {
+        textToSend = `Attached ${currentFiles.length} ${currentFiles.length === 1 ? 'file' : 'files'}`;
+      }
 
       await client.sendMessage({
         cascadeId: targetSessionId,
-        text: actualText || (currentAudio?.transcription ? `Voice message: "${currentAudio.transcription}"` : 'Voice message'),
+        text: textToSend,
         modelEnum: modelToUse,
         thinkingBudget: parseInt(thinkingBudget, 10),
         autoExecutionPolicy,
-        media: mediaPayload,
+        media: allMedia,
+        images: imagePayload,
         ...(isPlan ? { planningMode: 'PLANNING_MODE_ON' } : {})
       });
     } catch (err) {
@@ -1791,6 +1961,24 @@ export default function App() {
                         <audio controls src={msg.audio.url} className="chat-audio-element" />
                       </div>
                     )}
+                    {msg.files && msg.files.length > 0 && (
+                      <div className="message-attached-files-row">
+                        {msg.files.map((f, fIdx) => (
+                          f.isImage ? (
+                            <div key={fIdx} className="message-image-thumb-box">
+                              <img src={f.previewUrl} alt={f.name} className="message-user-img" />
+                              <span className="message-img-caption" title={f.name}>{f.name}</span>
+                            </div>
+                          ) : (
+                            <div key={fIdx} className="message-file-badge">
+                              <FileText size={12} color="#38bdf8" />
+                              <span className="message-file-name" title={f.name}>{f.name}</span>
+                              <span className="message-file-size">({f.sizeFormatted})</span>
+                            </div>
+                          )
+                        ))}
+                      </div>
+                    )}
                   </div>
                   {activeSessionId && idx > 0 && (
                     <button
@@ -1851,6 +2039,7 @@ export default function App() {
 
                       if (step.type === 'planner') {
                         const thinkKey = `${idx}-${step.stepIndex}`;
+                        const extractedImages = step.content ? extractImageReferences(step.content) : [];
                         return (
                           <div key={sIdx} className="step-block">
                             {step.thinking && (
@@ -1869,6 +2058,42 @@ export default function App() {
                             )}
                             {step.content && (
                               <div className="assistant-text">{step.content}</div>
+                            )}
+                            {extractedImages.length > 0 && (
+                              <div className="generated-images-container">
+                                {extractedImages.map((img, iIdx) => {
+                                  const isWebUrl = img.path.startsWith('http://') || img.path.startsWith('https://') || img.path.startsWith('data:');
+                                  return (
+                                    <div key={iIdx} className="generated-image-card">
+                                      <div className="generated-image-header">
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                          <ImageIcon size={14} color="#38bdf8" />
+                                          <span className="generated-image-title">Generated Image: {img.alt}</span>
+                                        </div>
+                                        <button
+                                          type="button"
+                                          className="btn-copy-image-path"
+                                          onClick={() => {
+                                            navigator.clipboard.writeText(img.path);
+                                            showToast('Image path copied to clipboard', 'success');
+                                          }}
+                                          title="Copy image path"
+                                        >
+                                          <Copy size={12} /> Copy Path
+                                        </button>
+                                      </div>
+                                      <div className="generated-image-filepath-box">
+                                        <code className="image-filepath-text">{img.path}</code>
+                                      </div>
+                                      {isWebUrl && (
+                                        <div className="generated-image-preview">
+                                          <img src={img.path} alt={img.alt} className="response-img" />
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
                             )}
                           </div>
                         );
@@ -2089,162 +2314,250 @@ export default function App() {
         </div>
 
         {/* Prompt Input Box */}
-        <div className="input-area" style={{ position: 'relative' }}>
-          {/* Slash Command Autocomplete Popover */}
-          {slashMenuOpen && filteredSlashCommands.length > 0 && (
-            <div className="slash-autocomplete-popover">
-              <div className="slash-autocomplete-header">
-                Slash Commands & Skills ({filteredSlashCommands.length})
-              </div>
-              {filteredSlashCommands.map((cmd, idx) => (
-                <div
-                  key={cmd.name}
-                  className={`slash-command-item ${idx === slashSelectedIndex ? 'active' : ''}`}
-                  onClick={() => applySlashCommand(cmd.name)}
-                  onMouseEnter={() => setSlashSelectedIndex(idx)}
-                >
-                  <div className="slash-command-left">
-                    <span className="slash-command-name">/{cmd.name}</span>
-                    <span className="slash-command-desc">{cmd.description}</span>
-                  </div>
-                  <span className="slash-command-tag">{cmd.type || 'command'}</span>
+        <div className="input-area" onDragOver={handleDragOver} onDrop={handleDrop} style={{ position: 'relative' }}>
+          <div className="input-inner-container">
+            {/* Slash Command Autocomplete Popover */}
+            {slashMenuOpen && filteredSlashCommands.length > 0 && (
+              <div className="slash-autocomplete-popover">
+                <div className="slash-autocomplete-header">
+                  Slash Commands & Skills ({filteredSlashCommands.length})
                 </div>
-              ))}
-            </div>
-          )}
-
-          {runningTasksCount > 0 && (
-            <div className="running-tasks-banner" onClick={() => setShowTasksModal(true)}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <Loader2 size={14} className="spin" color="#fbbf24" />
-                <span>
-                  <strong>{runningTasksCount}</strong> background {runningTasksCount === 1 ? 'command' : 'commands'} currently executing
-                </span>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span className="view-tasks-link">View Progress & Stop &rarr;</span>
-              </div>
-            </div>
-          )}
-
-          {isRecording && (
-            <div className="voice-recording-banner">
-              <div className="voice-recording-left">
-                <span className="voice-recording-dot"></span>
-                <span className="voice-recording-label">
-                  Recording ({Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')})
-                </span>
-                <div className="voice-wave-container">
-                  <span className="voice-wave-bar"></span>
-                  <span className="voice-wave-bar"></span>
-                  <span className="voice-wave-bar"></span>
-                  <span className="voice-wave-bar"></span>
-                  <span className="voice-wave-bar"></span>
-                </div>
-                <span className="voice-recording-hint">Speak now — click Stop to review or Send Now to submit</span>
-              </div>
-              <div className="voice-recording-actions">
-                <button
-                  type="button"
-                  className="btn-cancel-voice-recording"
-                  onClick={cancelAudioRecording}
-                  title="Discard recording"
-                >
-                  <X size={12} /> Cancel
-                </button>
-                <button
-                  type="button"
-                  className="btn-stop-voice-recording"
-                  onClick={stopAudioRecording}
-                  title="Stop recording and keep voice note attached"
-                >
-                  <Square size={11} fill="currentColor" /> Stop
-                </button>
-                <button
-                  type="button"
-                  className="btn-send-voice-recording"
-                  onClick={handleVoiceSend}
-                  title="Stop and send prompt immediately"
-                >
-                  <Send size={12} /> Send Now
-                </button>
-              </div>
-            </div>
-          )}
-
-          {attachedAudio && (
-            <div className="attached-audio-card">
-              <div className="attached-audio-left">
-                <div className="attached-audio-icon-box">
-                  <Mic size={14} color="#38bdf8" />
-                </div>
-                <div className="attached-audio-details">
-                  <div className="attached-audio-title-row">
-                    <span className="attached-audio-badge">Voice Note</span>
-                    <span className="attached-audio-time">{attachedAudio.durationFormatted}</span>
-                  </div>
-                  {attachedAudio.transcription && (
-                    <div className="attached-audio-transcript">
-                      "{attachedAudio.transcription}"
+                {filteredSlashCommands.map((cmd, idx) => (
+                  <div
+                    key={cmd.name}
+                    className={`slash-command-item ${idx === slashSelectedIndex ? 'active' : ''}`}
+                    onClick={() => applySlashCommand(cmd.name)}
+                    onMouseEnter={() => setSlashSelectedIndex(idx)}
+                  >
+                    <div className="slash-command-left">
+                      <span className="slash-command-name">/{cmd.name}</span>
+                      <span className="slash-command-desc">{cmd.description}</span>
                     </div>
-                  )}
+                    <span className="slash-command-tag">{cmd.type || 'command'}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {runningTasksCount > 0 && (
+              <div className="running-tasks-banner" onClick={() => setShowTasksModal(true)}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <Loader2 size={14} className="spin" color="#fbbf24" />
+                  <span>
+                    <strong>{runningTasksCount}</strong> background {runningTasksCount === 1 ? 'command' : 'commands'} currently executing
+                  </span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <span className="view-tasks-link">View Progress & Stop &rarr;</span>
                 </div>
               </div>
-              <audio controls src={attachedAudio.url} className="attached-audio-player" />
-              <button
-                type="button"
-                className="btn-remove-audio"
-                onClick={() => setAttachedAudio(null)}
-                title="Discard attached voice note"
-              >
-                <Trash2 size={13} />
-              </button>
-            </div>
-          )}
+            )}
 
-          <form className="input-box-wrapper" onSubmit={handleSendMessage}>
-            <textarea
-              className="chat-input"
-              placeholder={isRecording ? "Listening to your voice..." : (attachedAudio ? "Add optional instructions to your voice note..." : "Type / for commands & skills, or prompt agy daemon directly...")}
-              value={inputPrompt}
-              onChange={handlePromptChange}
-              onKeyDown={handlePromptKeyDown}
+            {isRecording && (
+              <div className="voice-recording-banner">
+                <div className="voice-recording-left">
+                  <span className="voice-recording-dot"></span>
+                  <span className="voice-recording-label">
+                    Recording ({Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')})
+                  </span>
+                  <div className="voice-wave-container">
+                    <span className="voice-wave-bar"></span>
+                    <span className="voice-wave-bar"></span>
+                    <span className="voice-wave-bar"></span>
+                    <span className="voice-wave-bar"></span>
+                    <span className="voice-wave-bar"></span>
+                  </div>
+                  <span className="voice-recording-hint">Speak now — click Stop to review or Send Now to submit</span>
+                </div>
+                <div className="voice-recording-actions">
+                  <button
+                    type="button"
+                    className="btn-cancel-voice-recording"
+                    onClick={cancelAudioRecording}
+                    title="Discard recording"
+                  >
+                    <X size={12} /> Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-stop-voice-recording"
+                    onClick={stopAudioRecording}
+                    title="Stop recording and keep voice note attached"
+                  >
+                    <Square size={11} fill="currentColor" /> Stop
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-send-voice-recording"
+                    onClick={handleVoiceSend}
+                    title="Stop and send prompt immediately"
+                  >
+                    <Send size={12} /> Send Now
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {attachedAudio && (
+              <div className="attached-audio-card">
+                <div className="attached-audio-left">
+                  <div className="attached-audio-icon-box">
+                    <Mic size={14} color="#38bdf8" />
+                  </div>
+                  <div className="attached-audio-details">
+                    <div className="attached-audio-title-row">
+                      <span className="attached-audio-badge">Voice Note</span>
+                      <span className="attached-audio-time">{attachedAudio.durationFormatted}</span>
+                    </div>
+                    {attachedAudio.transcription && (
+                      <div className="attached-audio-transcript">
+                        "{attachedAudio.transcription}"
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <audio controls src={attachedAudio.url} className="attached-audio-player" />
+                <button
+                  type="button"
+                  className="btn-remove-audio"
+                  onClick={() => setAttachedAudio(null)}
+                  title="Discard attached voice note"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
+            )}
+
+            {/* Nice compact attachment preview box docked neatly right above chat */}
+            {attachedFiles.length > 0 && (
+              <div className="attached-files-preview-bar">
+                <div className="attached-files-header">
+                  <div className="attached-files-title">
+                    <Paperclip size={12} color="#38bdf8" />
+                    <span>Attachments ({attachedFiles.length})</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-clear-all-files"
+                    onClick={() => {
+                      attachedFiles.forEach(f => {
+                        if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+                      });
+                      setAttachedFiles([]);
+                    }}
+                    title="Remove all attachments"
+                  >
+                    Clear all
+                  </button>
+                </div>
+                <div className="attached-files-scroll">
+                  {attachedFiles.map((fileItem) => (
+                    <div
+                      key={fileItem.id}
+                      className={`file-preview-card ${fileItem.isImage ? 'is-image' : 'is-doc'}`}
+                      title={`${fileItem.name} (${fileItem.sizeFormatted})`}
+                    >
+                      {fileItem.isImage ? (
+                        <div className="image-thumbnail-wrapper">
+                          <img
+                            src={fileItem.previewUrl}
+                            alt={fileItem.name}
+                            className="image-preview-thumb"
+                          />
+                          <div className="file-name-overlay">{fileItem.name}</div>
+                        </div>
+                      ) : (
+                        <div className="doc-preview-content">
+                          <FileText size={14} color="#38bdf8" />
+                          <div className="doc-preview-meta">
+                            <span className="doc-preview-name">{fileItem.name}</span>
+                            <span className="doc-preview-size">{fileItem.sizeFormatted}</span>
+                          </div>
+                        </div>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-remove-attached-file"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removeAttachedFile(fileItem.id);
+                        }}
+                        title={`Remove ${fileItem.name}`}
+                      >
+                        <X size={11} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <input
+              type="file"
+              multiple
+              ref={fileInputRef}
+              accept="image/*,.png,.jpg,.jpeg,.gif,.webp,.svg,.bmp,text/*,.txt,.md,.py,.js,.jsx,.ts,.tsx,.json,.html,.css,.sh,.yml,.yaml,.log"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                handleFilesSelected(e.target.files);
+                e.target.value = '';
+              }}
             />
 
-            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <button
-                type="button"
-                className={`btn-mic ${isRecording ? 'recording' : ''}`}
-                onClick={toggleRecording}
-                title={isRecording ? 'Stop Voice Recording' : 'Record Voice Note'}
-              >
-                {isRecording ? (
-                  <>
-                    <Square size={11} fill="currentColor" />
-                    <span style={{ fontSize: '11px', fontWeight: 600, marginLeft: '4px' }}>
-                      {Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')}
-                    </span>
-                  </>
-                ) : (
-                  <Mic size={15} />
-                )}
-              </button>
+            <form className="input-box-wrapper" onSubmit={handleSendMessage}>
+              <textarea
+                className="chat-input"
+                placeholder={isRecording ? "Listening to your voice..." : (attachedAudio ? "Add optional instructions to your voice note..." : (attachedFiles.length > 0 ? "Add message for attached files (or press Send)..." : "Type / for commands & skills, or prompt agy daemon directly..."))}
+                value={inputPrompt}
+                onChange={handlePromptChange}
+                onKeyDown={handlePromptKeyDown}
+                onPaste={handlePaste}
+              />
 
-              {isGenerating ? (
-                <button type="button" className="stop-button" onClick={handleStop}>
-                  <Square size={14} /> Stop
-                </button>
-              ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                 <button
-                  type="submit"
-                  className="send-button"
-                  disabled={(!inputPrompt.trim() && !attachedAudio && !isRecording) || isGenerating}
+                  type="button"
+                  className="btn-attach-files"
+                  onClick={() => fileInputRef.current?.click()}
+                  title="Attach files or images (multiple allowed)"
                 >
-                  <Send size={14} /> Send
+                  <Paperclip size={15} />
                 </button>
-              )}
-            </div>
-          </form>
+
+                <button
+                  type="button"
+                  className={`btn-mic ${isRecording ? 'recording' : ''}`}
+                  onClick={toggleRecording}
+                  title={isRecording ? 'Stop Voice Recording' : 'Record Voice Note'}
+                >
+                  {isRecording ? (
+                    <>
+                      <Square size={11} fill="currentColor" />
+                      <span style={{ fontSize: '11px', fontWeight: 600, marginLeft: '4px' }}>
+                        {Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')}
+                      </span>
+                    </>
+                  ) : (
+                    <Mic size={15} />
+                  )}
+                </button>
+
+                {isGenerating ? (
+                  <button type="button" className="stop-button" onClick={handleStop}>
+                    <Square size={14} /> Stop
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    className="send-button"
+                    disabled={(!inputPrompt.trim() && !attachedAudio && attachedFiles.length === 0 && !isRecording) || isGenerating}
+                  >
+                    <Send size={14} /> Send
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
         </div>
       </div>
 

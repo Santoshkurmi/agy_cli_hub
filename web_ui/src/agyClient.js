@@ -718,7 +718,8 @@ export class AntigravityBrowserClient {
     autoExecutionPolicy = 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER',
     autoExecute,
     planningMode,
-    media = []
+    media = [],
+    images = []
   }) {
     if (!this.csrfToken) await this.initCsrfToken();
 
@@ -733,8 +734,9 @@ export class AntigravityBrowserClient {
 
     const payload = {
       cascadeId,
-      items: [{ text: text || (media && media.length > 0 ? 'Voice message' : '') }],
+      items: [{ text: text || (media && media.length > 0 ? 'Media message' : (images && images.length > 0 ? 'Image message' : '')) }],
       ...(media && media.length > 0 ? { media } : {}),
+      ...(images && images.length > 0 ? { images } : {}),
       cascadeConfig: {
         plannerConfig: {
           toolConfig: {
