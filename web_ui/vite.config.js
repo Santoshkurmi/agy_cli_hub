@@ -38,9 +38,50 @@ function configSyncPlugin() {
   };
 }
 
+function fileServerPlugin() {
+  return {
+    name: 'file-server',
+    configureServer(server) {
+      server.middlewares.use('/api/serve-file', (req, res) => {
+        try {
+          const urlObj = new URL(req.url, 'http://localhost');
+          const filePath = urlObj.searchParams.get('path');
+          if (!filePath || !fs.existsSync(filePath)) {
+            res.statusCode = 404;
+            res.end('File not found');
+            return;
+          }
+          const ext = filePath.split('.').pop().toLowerCase();
+          const mimeTypes = {
+            jpg: 'image/jpeg',
+            jpeg: 'image/jpeg',
+            png: 'image/png',
+            gif: 'image/gif',
+            webp: 'image/webp',
+            svg: 'image/svg+xml',
+            bmp: 'image/bmp',
+            webm: 'audio/webm',
+            mp3: 'audio/mpeg',
+            wav: 'audio/wav',
+            ogg: 'audio/ogg',
+            m4a: 'audio/mp4'
+          };
+          const contentType = mimeTypes[ext] || 'application/octet-stream';
+          res.setHeader('Content-Type', contentType);
+          res.setHeader('Cache-Control', 'public, max-age=3600');
+          fs.createReadStream(filePath).pipe(res);
+        } catch (err) {
+          res.statusCode = 500;
+          res.end(err.message);
+        }
+      });
+    }
+  };
+}
+
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), configSyncPlugin()],
+  plugins: [react(), configSyncPlugin(), fileServerPlugin()],
   server: {
     port: 5173
   }

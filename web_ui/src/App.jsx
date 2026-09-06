@@ -85,13 +85,22 @@ function extractImageReferences(text) {
   if (!text || typeof text !== 'string') return [];
   const results = [];
 
+  const toPreviewUrl = (p) => {
+    if (!p) return '';
+    if (p.startsWith('http://') || p.startsWith('https://') || p.startsWith('data:')) {
+      return p;
+    }
+    const clean = p.replace(/^file:\/\//, '');
+    return `/api/serve-file?path=${encodeURIComponent(clean)}`;
+  };
+
   // Markdown image syntax: ![alt](url_or_path)
   const mdRegex = /!\[([^\]]*)\]\(([^)]+)\)/g;
   let match;
   while ((match = mdRegex.exec(text)) !== null) {
     const p = match[2].trim();
     if (!results.some(r => r.path === p)) {
-      results.push({ alt: match[1] || 'Generated image', path: p });
+      results.push({ alt: match[1] || 'Generated image', path: p, previewUrl: toPreviewUrl(p) });
     }
   }
 
@@ -100,7 +109,7 @@ function extractImageReferences(text) {
   while ((match = urlRegex.exec(text)) !== null) {
     const u = match[1].trim();
     if (!results.some(r => r.path === u)) {
-      results.push({ alt: u.split('/').pop() || 'Image', path: u });
+      results.push({ alt: u.split('/').pop() || 'Image', path: u, previewUrl: u });
     }
   }
 
@@ -109,7 +118,7 @@ function extractImageReferences(text) {
   while ((match = pathRegex.exec(text)) !== null) {
     const p = match[1].trim();
     if (!results.some(r => r.path === p)) {
-      results.push({ alt: p.split('/').pop() || 'Image', path: p });
+      results.push({ alt: p.split('/').pop() || 'Image', path: p, previewUrl: toPreviewUrl(p) });
     }
   }
 
@@ -1108,6 +1117,33 @@ export default function App() {
                 isBlocking: update.isBlocking
               };
             }
+          } else if (update.type === 'generate_image') {
+            let genStep = stepObj || last.steps.find(s => s.type === 'generate_image' && (s.stepIndex === update.stepIndex || s.imageName === update.imageName));
+            if (!genStep) {
+              const newStep = {
+                stepIndex: update.stepIndex,
+                type: 'generate_image',
+                prompt: update.prompt,
+                imageName: update.imageName,
+                filePath: update.filePath || '',
+                previewUrl: update.previewUrl || (update.filePath ? `/api/serve-file?path=${encodeURIComponent(update.filePath.replace(/^file:\/\//, ''))}` : ''),
+                status: update.status
+              };
+              last.steps.push(newStep);
+            } else {
+              const sIdx = last.steps.indexOf(genStep);
+              const mergedFilePath = update.filePath || genStep.filePath || '';
+              const mergedPreviewUrl = update.previewUrl || genStep.previewUrl || (mergedFilePath ? `/api/serve-file?path=${encodeURIComponent(mergedFilePath.replace(/^file:\/\//, ''))}` : '');
+              last.steps[sIdx] = {
+                ...genStep,
+                type: 'generate_image',
+                prompt: update.prompt || genStep.prompt,
+                imageName: update.imageName || genStep.imageName,
+                filePath: mergedFilePath,
+                previewUrl: mergedPreviewUrl,
+                status: update.status || genStep.status
+              };
+            }
           } else if (update.type === 'error') {
             const errIdx = last.steps.findIndex(s => s.type === 'exec_error');
             const newErrStep = {
@@ -2085,16 +2121,85 @@ export default function App() {
                                       <div className="generated-image-filepath-box">
                                         <code className="image-filepath-text">{img.path}</code>
                                       </div>
-                                      {isWebUrl && (
-                                        <div className="generated-image-preview">
-                                          <img src={img.path} alt={img.alt} className="response-img" />
-                                        </div>
-                                      )}
+                                      <div className="generated-image-preview">
+                                        <img
+                                          src={img.previewUrl || img.path}
+                                          alt={img.alt}
+                                          className="response-img"
+                                          onError={(e) => {
+                                            if (!e.currentTarget.dataset.retried) {
+                                              e.currentTarget.dataset.retried = 'true';
+                                              const clean = img.path.replace(/^file:\/\//, '');
+                                              e.currentTarget.src = `/api/serve-file?path=${encodeURIComponent(clean)}`;
+                                            } else {
+                                              e.currentTarget.style.display = 'none';
+                                            }
+                                          }}
+                                        />
+                                      </div>
                                     </div>
                                   );
                                 })}
                               </div>
                             )}
+                          </div>
+                        );
+                      }
+
+                      if (step.type === 'generate_image') {
+                        return (
+                          <div key={sIdx} className="step-block">
+                            <div className="generated-image-card">
+                              <div className="generated-image-header">
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                  <ImageIcon size={14} color="#38bdf8" />
+                                  <span className="generated-image-title">Generated Image: {step.imageName || 'Image'}</span>
+                                </div>
+                                {step.filePath && (
+                                  <button
+                                    type="button"
+                                    className="btn-copy-image-path"
+                                    onClick={() => {
+                                      navigator.clipboard.writeText(step.filePath);
+                                      showToast('Image path copied to clipboard', 'success');
+                                    }}
+                                    title="Copy image path"
+                                  >
+                                    <Copy size={12} /> Copy Path
+                                  </button>
+                                )}
+                              </div>
+                              {step.prompt && (
+                                <div style={{ fontSize: '12px', color: '#94a3b8', fontStyle: 'italic', marginBottom: '8px' }}>
+                                  "{step.prompt}"
+                                </div>
+                              )}
+                              {step.filePath && (
+                                <div className="generated-image-filepath-box">
+                                  <code className="image-filepath-text">{step.filePath}</code>
+                                </div>
+                              )}
+                              {(step.previewUrl || step.filePath) ? (
+                                <div className="generated-image-preview">
+                                  <img
+                                    src={step.previewUrl || `/api/serve-file?path=${encodeURIComponent(step.filePath.replace(/^file:\/\//, ''))}`}
+                                    alt={step.imageName || 'Generated image'}
+                                    className="response-img"
+                                    onError={(e) => {
+                                      if (step.filePath && !e.currentTarget.dataset.retried) {
+                                        e.currentTarget.dataset.retried = 'true';
+                                        e.currentTarget.src = `/api/serve-file?path=${encodeURIComponent(step.filePath.replace(/^file:\/\//, ''))}`;
+                                      }
+                                    }}
+                                  />
+                                </div>
+                              ) : (
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontSize: '13px', padding: '12px 0' }}>
+                                  <Loader2 size={15} className="spin" color="#38bdf8" />
+                                  <span>Generating image, please wait...</span>
+                                </div>
+                              )}
+                            </div>
                           </div>
                         );
                       }

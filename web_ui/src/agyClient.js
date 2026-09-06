@@ -435,9 +435,148 @@ export class AntigravityBrowserClient {
     (steps || []).forEach((step, idx) => {
       const stepIndex = step.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? idx;
       if (step.userInput) {
-        const text = step.userInput.userResponse || step.userInput.items?.[0]?.text || '';
-        if (text) {
-          turns.push({ role: 'user', content: text, stepIndex });
+        const rawText = step.userInput.userResponse || step.userInput.items?.[0]?.text || '';
+        let cleanText = rawText;
+
+        // 1. If wrapped in <USER_REQUEST>, extract the clean user request
+        const userReqMatch = rawText.match(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/i);
+        if (userReqMatch) {
+          cleanText = userReqMatch[1].trim();
+        } else {
+          // Clean out system metadata tags so user only sees their own message
+          cleanText = cleanText
+            .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, '')
+            .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, '')
+            .replace(/<system_instructions>[\s\S]*?<\/system_instructions>/gi, '')
+            .trim();
+        }
+
+        // Parse user-attached media (images, audio voice notes, documents)
+        const parsedFiles = [];
+        let parsedAudio = null;
+
+        const mediaList = [
+          ...(step.userInput.media || []),
+          ...((step.userInput.items || []).map(it => it.media).filter(Boolean))
+        ];
+
+        mediaList.forEach((m, mIdx) => {
+          const rawUri = m.uri || m.path || '';
+          const filePath = rawUri.replace(/^file:\/\//, '');
+          const mimeType = m.mimeType || '';
+          const isAudio = mimeType.startsWith('audio/') || /\.(webm|mp3|wav|ogg|m4a)$/i.test(filePath);
+          const isImage = mimeType.startsWith('image/') || /\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(filePath);
+
+          if (isAudio && !parsedAudio) {
+            const url = m.inlineData 
+              ? `data:${mimeType || 'audio/webm'};base64,${m.inlineData}`
+              : (filePath ? `/api/serve-file?path=${encodeURIComponent(filePath)}` : '');
+            const duration = m.durationSeconds || 0;
+            const minutes = Math.floor(duration / 60);
+            const seconds = Math.floor(duration % 60).toString().padStart(2, '0');
+            parsedAudio = {
+              url,
+              duration,
+              durationFormatted: duration > 0 ? `${minutes}:${seconds}` : 'Voice Note',
+              transcription: m.description || ''
+            };
+          } else if (isImage) {
+            const previewUrl = m.inlineData
+              ? `data:${mimeType || 'image/png'};base64,${m.inlineData}`
+              : (filePath ? `/api/serve-file?path=${encodeURIComponent(filePath)}` : '');
+            const fileName = m.description || filePath.split('/').pop() || `image_${mIdx + 1}.png`;
+            if (!parsedFiles.some(f => f.previewUrl === previewUrl)) {
+              parsedFiles.push({
+                id: `hist_img_${stepIndex}_${mIdx}`,
+                name: fileName,
+                isImage: true,
+                previewUrl,
+                sizeFormatted: ''
+              });
+            }
+          } else {
+            const fileName = m.description || filePath.split('/').pop() || `file_${mIdx + 1}`;
+            parsedFiles.push({
+              id: `hist_file_${stepIndex}_${mIdx}`,
+              name: fileName,
+              isImage: false,
+              sizeFormatted: ''
+            });
+          }
+        });
+
+        // Also check if step.userInput.images exists
+        const imagesList = [
+          ...(step.userInput.images || []),
+          ...((step.userInput.items || []).filter(it => it.image).map(it => it.image))
+        ];
+        imagesList.forEach((img, iIdx) => {
+          const base64Data = img.value || img.inlineData;
+          if (base64Data) {
+            parsedFiles.push({
+              id: `hist_raw_img_${stepIndex}_${iIdx}`,
+              name: `image_${iIdx + 1}.png`,
+              isImage: true,
+              previewUrl: `data:image/png;base64,${base64Data}`,
+              sizeFormatted: ''
+            });
+          } else if (img.uri) {
+            const fPath = img.uri.replace(/^file:\/\//, '');
+            const pUrl = `/api/serve-file?path=${encodeURIComponent(fPath)}`;
+            if (!parsedFiles.some(f => f.previewUrl === pUrl)) {
+              parsedFiles.push({
+                id: `hist_raw_img_${stepIndex}_${iIdx}`,
+                name: fPath.split('/').pop() || `image_${iIdx + 1}.png`,
+                isImage: true,
+                previewUrl: pUrl,
+                sizeFormatted: ''
+              });
+            }
+          }
+        });
+
+        // Also extract any user uploaded files or images from the metadata/text itself
+        // (daemon injects "The user has uploaded 1 image(s):\n- /path/to/.user_uploaded/uploaded_media_...png")
+        const uploadedImgRegex = /(?:^|\s|- )(\/[^\s"')>]+\.(?:png|jpe?g|webp|gif|svg|bmp))/gi;
+        let imgMatch;
+        while ((imgMatch = uploadedImgRegex.exec(rawText)) !== null) {
+          const filePath = imgMatch[1].trim();
+          const fileName = filePath.split('/').pop() || 'uploaded_image.png';
+          const pUrl = `/api/serve-file?path=${encodeURIComponent(filePath)}`;
+          if (!parsedFiles.some(f => f.previewUrl === pUrl || f.name === fileName)) {
+            parsedFiles.push({
+              id: `hist_img_extracted_${stepIndex}_${parsedFiles.length}`,
+              name: fileName,
+              isImage: true,
+              previewUrl: pUrl,
+              sizeFormatted: ''
+            });
+          }
+        }
+
+        // Also extract attached code / text files formatted as [Attached File: filename]
+        const attachedDocRegex = /\[Attached File:\s*([^\]]+)\]\s*```[^\n]*\n([\s\S]*?)```/gi;
+        let docMatch;
+        while ((docMatch = attachedDocRegex.exec(rawText)) !== null) {
+          const fileName = docMatch[1].trim();
+          if (!parsedFiles.some(f => f.name === fileName)) {
+            parsedFiles.push({
+              id: `hist_doc_extracted_${stepIndex}_${parsedFiles.length}`,
+              name: fileName,
+              isImage: false,
+              sizeFormatted: `${docMatch[2].length} chars`
+            });
+          }
+        }
+
+        if (cleanText || parsedFiles.length > 0 || parsedAudio) {
+          turns.push({
+            role: 'user',
+            content: cleanText,
+            files: parsedFiles.length > 0 ? parsedFiles : undefined,
+            audio: parsedAudio,
+            stepIndex
+          });
           currentAssistant = { role: 'assistant', steps: [] };
           turns.push(currentAssistant);
         }
@@ -643,13 +782,52 @@ export class AntigravityBrowserClient {
             error: err,
             status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE')
           });
-        } else if (step.metadata?.toolAction || step.generic) {
+        } else if (step.generateImage || step.type === 'CORTEX_STEP_TYPE_GENERATE_IMAGE') {
+          const gen = step.generateImage || {};
+          const rawUri = gen.generatedMedia?.uri || gen.uri || '';
+          const filePath = rawUri.replace(/^file:\/\//, '');
+          const prompt = gen.prompt || step.metadata?.toolAction || 'Generated image';
+          const imageName = gen.imageName || 'image';
+          const mimeType = gen.generatedMedia?.mimeType || 'image/jpeg';
+          const inlineData = gen.generatedMedia?.inlineData || '';
+          const previewUrl = inlineData
+            ? `data:${mimeType};base64,${inlineData}`
+            : (filePath ? `/api/serve-file?path=${encodeURIComponent(filePath)}` : '');
+
           currentAssistant.steps.push({
             stepIndex,
-            type: 'tool',
-            toolType: 'generic',
-            label: step.metadata?.toolAction || step.generic?.toolAction || 'Tool Action'
+            type: 'generate_image',
+            prompt,
+            imageName,
+            filePath,
+            previewUrl,
+            status: step.status || 'CORTEX_STEP_STATUS_DONE'
           });
+        } else if (step.metadata?.toolAction || step.generic) {
+          const genericContent = step.generic?.content || step.content || step.metadata?.toolSummary || '';
+          const genSavedMatch = genericContent.match(/Generated image is saved at\s+([^\s\.]+\.(?:png|jpe?g|webp|gif|svg))/i);
+          if (genSavedMatch) {
+            const filePath = genSavedMatch[1].replace(/^file:\/\//, '');
+            const promptMatch = genericContent.match(/Using prompt:\s*([^\n\r]+)/i);
+            const prompt = promptMatch ? promptMatch[1].trim() : 'Generated image';
+            const imageName = filePath.split('/').pop()?.split('.')[0] || 'generated_image';
+            currentAssistant.steps.push({
+              stepIndex,
+              type: 'generate_image',
+              prompt,
+              imageName,
+              filePath,
+              previewUrl: `/api/serve-file?path=${encodeURIComponent(filePath)}`,
+              status: step.status || 'CORTEX_STEP_STATUS_DONE'
+            });
+          } else {
+            currentAssistant.steps.push({
+              stepIndex,
+              type: 'tool',
+              toolType: 'generic',
+              label: step.metadata?.toolAction || step.generic?.toolAction || 'Tool Action'
+            });
+          }
         }
       }
     });
@@ -808,6 +986,7 @@ export class AntigravityBrowserClient {
     const stepResponseOffsets = new Map();
     const stepThinkingOffsets = new Map();
     const seenToolSteps = new Set();
+    const seenGenImgUris = new Map();
     let isDone = false;
     let isFirstChunk = true;
     const markDone = () => {
@@ -892,6 +1071,11 @@ export class AntigravityBrowserClient {
             }
             if (step.find) {
               seenToolSteps.add(`find-${stepIndex}`);
+            }
+            if (step.generateImage || step.type === 'CORTEX_STEP_TYPE_GENERATE_IMAGE') {
+              seenToolSteps.add(`genimg-${stepIndex}`);
+              const genUri = step.generateImage?.generatedMedia?.uri || step.generateImage?.uri || '';
+              if (genUri) seenGenImgUris.set(stepIndex, genUri);
             }
           }
 
@@ -1184,6 +1368,45 @@ export class AntigravityBrowserClient {
               status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE'),
               stepIndex
             });
+          }
+
+          const isGenImage = Boolean(step.generateImage || step.type === 'CORTEX_STEP_TYPE_GENERATE_IMAGE');
+          const genericContent = step.generic?.content || step.content || '';
+          const genSavedMatch = genericContent.match(/Generated image is saved at\s+([^\s\.]+\.(?:png|jpe?g|webp|gif|svg))/i);
+
+          if (isGenImage || genSavedMatch) {
+            const gen = step.generateImage || {};
+            let rawUri = gen.generatedMedia?.uri || gen.uri || '';
+            if (!rawUri && genSavedMatch) {
+              rawUri = genSavedMatch[1];
+            }
+            const filePath = rawUri.replace(/^file:\/\//, '');
+            const prompt = gen.prompt || (genericContent.match(/Using prompt:\s*([^\n\r]+)/i)?.[1]) || step.metadata?.toolAction || 'Generated image';
+            const imageName = gen.imageName || (filePath ? filePath.split('/').pop()?.split('.')[0] : 'image');
+            const mimeType = gen.generatedMedia?.mimeType || 'image/jpeg';
+            const inlineData = gen.generatedMedia?.inlineData || '';
+            const previewUrl = inlineData
+              ? `data:${mimeType};base64,${inlineData}`
+              : (filePath ? `/api/serve-file?path=${encodeURIComponent(filePath)}` : '');
+
+            const prevKey = `genimg-${stepIndex}`;
+            const prevRecordedUri = seenGenImgUris.get(stepIndex);
+
+            // Emit if this step hasn't been emitted yet, OR if the image file URI just arrived!
+            if (!seenToolSteps.has(prevKey) || (rawUri && rawUri !== prevRecordedUri)) {
+              seenToolSteps.add(prevKey);
+              if (rawUri) seenGenImgUris.set(stepIndex, rawUri);
+
+              onUpdate({
+                type: 'generate_image',
+                stepIndex,
+                prompt,
+                imageName,
+                filePath,
+                previewUrl,
+                status: step.status || (filePath ? 'CORTEX_STEP_STATUS_DONE' : 'CORTEX_STEP_STATUS_RUNNING')
+              });
+            }
           }
         }
 
