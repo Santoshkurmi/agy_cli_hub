@@ -548,6 +548,58 @@ export class AntigravityBrowserClient {
             error: err,
             status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE')
           });
+        } else if (step.listDirectory) {
+          const rawUri = step.listDirectory.directoryPathUri || '';
+          const dirPath = rawUri.replace(/^file:\/\//, '') || 'Directory';
+          const dirName = dirPath.split('/').filter(Boolean).pop() || dirPath;
+          const items = step.listDirectory.results || [];
+          const label = step.metadata?.toolAction || `List: ${dirName} (${items.length} items)`;
+          const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
+
+          const metaLines = [`Directory: ${dirPath}`, `Items found: ${items.length}`];
+          if (items.length > 0) {
+            metaLines.push('');
+            items.forEach(item => {
+              const typePrefix = item.isDir ? '📁 [DIR] ' : '📄 [FILE]';
+              const sizeStr = item.sizeBytes ? ` (${Number(item.sizeBytes).toLocaleString()} bytes)` : '';
+              metaLines.push(`${typePrefix} ${item.name}${sizeStr}`);
+            });
+          } else {
+            metaLines.push('\n(Directory is empty)');
+          }
+
+          currentAssistant.steps.push({
+            stepIndex,
+            type: 'tool',
+            toolType: 'list',
+            label,
+            directory: dirPath,
+            output: metaLines.join('\n'),
+            error: err,
+            status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE')
+          });
+        } else if (step.find) {
+          const pattern = step.find.pattern || '';
+          const dir = step.find.searchDirectory || '';
+          const dirName = dir.split('/').filter(Boolean).pop() || dir;
+          const label = step.metadata?.toolAction || `Find: "${pattern}" in ${dirName}`;
+          const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
+          const out = [
+            `Pattern: ${pattern}`,
+            `Directory: ${dir}`,
+            step.find.maxDepth ? `Max Depth: ${step.find.maxDepth}` : '',
+            step.find.truncatedOutput ? `\nResults:\n${step.find.truncatedOutput}` : ''
+          ].filter(Boolean).join('\n');
+
+          currentAssistant.steps.push({
+            stepIndex,
+            type: 'tool',
+            toolType: 'find',
+            label,
+            output: out,
+            error: err,
+            status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE')
+          });
         } else if (step.metadata?.toolAction || step.generic) {
           currentAssistant.steps.push({
             stepIndex,
@@ -786,6 +838,12 @@ export class AntigravityBrowserClient {
             if (step.searchWeb) {
               seenToolSteps.add(`search-${stepIndex}`);
             }
+            if (step.listDirectory) {
+              seenToolSteps.add(`list-${stepIndex}`);
+            }
+            if (step.find) {
+              seenToolSteps.add(`find-${stepIndex}`);
+            }
           }
 
           const lastStep = steps[steps.length - 1];
@@ -1019,6 +1077,64 @@ export class AntigravityBrowserClient {
                 stepIndex
               });
             }
+          }
+
+          if (step.listDirectory && !seenToolSteps.has(`list-${stepIndex}`)) {
+            seenToolSteps.add(`list-${stepIndex}`);
+            const rawUri = step.listDirectory.directoryPathUri || '';
+            const dirPath = rawUri.replace(/^file:\/\//, '') || 'Directory';
+            const dirName = dirPath.split('/').filter(Boolean).pop() || dirPath;
+            const items = step.listDirectory.results || [];
+            const label = step.metadata?.toolAction || `List: ${dirName} (${items.length} items)`;
+            const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
+
+            const metaLines = [`Directory: ${dirPath}`, `Items found: ${items.length}`];
+            if (items.length > 0) {
+              metaLines.push('');
+              items.forEach(item => {
+                const typePrefix = item.isDir ? '📁 [DIR] ' : '📄 [FILE]';
+                const sizeStr = item.sizeBytes ? ` (${Number(item.sizeBytes).toLocaleString()} bytes)` : '';
+                metaLines.push(`${typePrefix} ${item.name}${sizeStr}`);
+              });
+            } else {
+              metaLines.push('\n(Directory is empty)');
+            }
+
+            onUpdate({
+              type: 'tool',
+              toolType: 'list',
+              label,
+              directory: dirPath,
+              output: metaLines.join('\n'),
+              error: err,
+              status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE'),
+              stepIndex
+            });
+          }
+
+          if (step.find && !seenToolSteps.has(`find-${stepIndex}`)) {
+            seenToolSteps.add(`find-${stepIndex}`);
+            const pattern = step.find.pattern || '';
+            const dir = step.find.searchDirectory || '';
+            const dirName = dir.split('/').filter(Boolean).pop() || dir;
+            const label = step.metadata?.toolAction || `Find: "${pattern}" in ${dirName}`;
+            const err = step.error?.shortError || step.error?.message || (typeof step.error === 'string' ? step.error : undefined);
+            const out = [
+              `Pattern: ${pattern}`,
+              `Directory: ${dir}`,
+              step.find.maxDepth ? `Max Depth: ${step.find.maxDepth}` : '',
+              step.find.truncatedOutput ? `\nResults:\n${step.find.truncatedOutput}` : ''
+            ].filter(Boolean).join('\n');
+
+            onUpdate({
+              type: 'tool',
+              toolType: 'find',
+              label,
+              output: out,
+              error: err,
+              status: step.status || (err ? 'CORTEX_STEP_STATUS_ERROR' : 'CORTEX_STEP_STATUS_DONE'),
+              stepIndex
+            });
           }
         }
 

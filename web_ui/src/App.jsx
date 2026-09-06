@@ -1044,6 +1044,10 @@ export default function App() {
                                   <Terminal size={14} style={{ flexShrink: 0 }} />
                                 ) : step.toolType === 'read' ? (
                                   <FileText size={14} color="#38bdf8" style={{ flexShrink: 0 }} />
+                                ) : step.toolType === 'list' ? (
+                                  <Folder size={14} color="#38bdf8" style={{ flexShrink: 0 }} />
+                                ) : step.toolType === 'find' ? (
+                                  <Search size={14} color="#f59e0b" style={{ flexShrink: 0 }} />
                                 ) : step.toolType === 'edit' ? (
                                   <Code size={14} color="#a855f7" style={{ flexShrink: 0 }} />
                                 ) : step.toolType === 'search' ? (
