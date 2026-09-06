@@ -171,7 +171,7 @@ export default function App() {
   const [hubUrl, setHubUrl] = useState('http://127.0.0.1:8090');
   const [connected, setConnected] = useState(false);
   const [conversations, setConversations] = useState([]);
-  const [activeSessionId, setActiveSessionId] = useState(initialUrlId && initialUrlId !== 'new' ? initialUrlId : null);
+  const [activeSessionId, setActiveSessionId] = useState(null);
   const [models, setModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState(() => {
     return localStorage.getItem('agy_preferred_model_enum') || '';
@@ -270,8 +270,9 @@ export default function App() {
   const turnStartStepRef = useRef(0);        // updated before each sendMessage
   const totalStepsRef = useRef(0);           // tracked from StreamAgentStateUpdates
   const isGeneratingRef = useRef(false);
-  const activeSessionIdRef = useRef(initialUrlId && initialUrlId !== 'new' ? initialUrlId : null);
-  const hasInitialSelectedRef = useRef(Boolean(initialUrlId));
+  const activeSessionIdRef = useRef(null);
+  // Mark as already handled if a specific session ID is in the URL — mount useEffect will call selectConversation for it
+  const hasInitialSelectedRef = useRef(Boolean(initialUrlId && initialUrlId !== 'new'));
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
