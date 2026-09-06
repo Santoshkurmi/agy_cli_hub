@@ -502,7 +502,7 @@ export default function App() {
         setCachedSlashCommands(formatted);
         try {
           localStorage.setItem('agy_slash_commands_cache', JSON.stringify(formatted));
-        } catch {}
+        } catch { }
         return formatted;
       }
     } catch (err) {
@@ -625,7 +625,7 @@ export default function App() {
         setIsGenerating(false);
         isGeneratingRef.current = false;
         // Clean up empty trajectory from server & sidebar
-        client.deleteCascadeTrajectory(activeSessionId).catch(() => {});
+        client.deleteCascadeTrajectory(activeSessionId).catch(() => { });
         setConversations(prev => prev.filter(c => c.id !== activeSessionId));
         setActiveSessionId(null);
         updateUrlForSession(null);
@@ -691,10 +691,10 @@ export default function App() {
             }
             if (tr) setInputPrompt(tr);
           };
-          rec.onerror = () => {};
+          rec.onerror = () => { };
           rec.start();
           recognitionRef.current = rec;
-        } catch {}
+        } catch { }
       }
 
       recordingStartTimeRef.current = Date.now();
@@ -711,7 +711,7 @@ export default function App() {
           recordingTimerRef.current = null;
         }
         if (recognitionRef.current) {
-          try { recognitionRef.current.stop(); } catch {}
+          try { recognitionRef.current.stop(); } catch { }
           recognitionRef.current = null;
         }
 
@@ -744,7 +744,7 @@ export default function App() {
                 setAttachedAudio(prev => prev ? { ...prev, transcription: transcribed } : null);
                 setInputPrompt(transcribed);
               }
-            }).catch(() => {});
+            }).catch(() => { });
           }
         };
         reader.readAsDataURL(recordedBlob);
@@ -779,7 +779,7 @@ export default function App() {
       }
     }
     if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch {}
+      try { recognitionRef.current.stop(); } catch { }
     }
     showToast('Voice note recorded & attached. Click Send to submit.', 'success');
   };
@@ -794,14 +794,14 @@ export default function App() {
       try {
         mediaRecorderRef.current.onstop = null;
         mediaRecorderRef.current.stop();
-      } catch {}
+      } catch { }
     }
     if (audioStreamRef.current) {
       audioStreamRef.current.getTracks().forEach(t => t.stop());
       audioStreamRef.current = null;
     }
     if (recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch {}
+      try { recognitionRef.current.stop(); } catch { }
     }
     audioChunksRef.current = [];
     showToast('Voice recording canceled.', 'info');
@@ -1028,7 +1028,7 @@ export default function App() {
       if (availableModels.length > 0) {
         const savedKey = localStorage.getItem('agy_preferred_model_key');
         const savedEnum = localStorage.getItem('agy_preferred_model_enum');
-        const matched = availableModels.find(m => 
+        const matched = availableModels.find(m =>
           (savedKey && m.key === savedKey) || (savedEnum && m.modelEnum === savedEnum)
         );
         if (matched) {
@@ -1428,7 +1428,7 @@ export default function App() {
       await client.handleCascadeUserInteraction(activeSessionId, stepIndex, trajectoryId, true, scope);
       const scopeLabel = scope === 'PERMISSION_SCOPE_ONCE' ? 'Run Once'
         : scope === 'PERMISSION_SCOPE_CONVERSATION' ? 'Always in Chat'
-        : 'Always in Workspace';
+          : 'Always in Workspace';
       showToast(`Command approved: ${scopeLabel}`, 'success');
     } catch (err) {
       console.warn('handleCascadeUserInteraction approval failed, trying fallback:', err);
@@ -1774,13 +1774,13 @@ export default function App() {
     handleSelectModel(target.modelEnum);
   };
 
-  const isGeminiModel = !activeModelObj || 
-    activeModelObj.key?.startsWith('gemini') || 
+  const isGeminiModel = !activeModelObj ||
+    activeModelObj.key?.startsWith('gemini') ||
     activeModelObj.modelProvider === 'MODEL_PROVIDER_GOOGLE';
 
-  const activeQuotaGroup = quotaSummary?.groups?.find(g => 
-    isGeminiModel 
-      ? g.displayName?.toLowerCase().includes('gemini') 
+  const activeQuotaGroup = quotaSummary?.groups?.find(g =>
+    isGeminiModel
+      ? g.displayName?.toLowerCase().includes('gemini')
       : (g.displayName?.toLowerCase().includes('claude') || g.displayName?.toLowerCase().includes('gpt'))
   );
 
@@ -2137,7 +2137,7 @@ export default function App() {
                   localStorage.setItem('agy_auto_exec_policy', val);
                   const fullPolicy = val === 'EAGER' ? 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER'
                     : val === 'AUTO' ? 'CASCADE_COMMANDS_AUTO_EXECUTION_AUTO'
-                    : 'CASCADE_COMMANDS_AUTO_EXECUTION_OFF';
+                      : 'CASCADE_COMMANDS_AUTO_EXECUTION_OFF';
                   client.setUserSettings(fullPolicy);
                 }}
                 title="Command Auto-Execution Policy: Eager (auto-run everything), Auto (smart safety), Off (ask user every time)"
@@ -2198,9 +2198,20 @@ export default function App() {
                       type="button"
                       id="profile-logout-btn"
                       className="profile-dropdown-action logout"
-                      onClick={() => {
+                      onClick={async () => {
                         setShowProfileMenu(false);
-                        showToast('To log out, run: agy logout in your terminal.', 'info');
+                        try {
+                          await client.authLogout();
+                          const [authRes, userRes] = await Promise.all([
+                            client.getAuthStatus(),
+                            client.getLocalUserInfo()
+                          ]);
+                          setAuthStatus(authRes);
+                          setUserInfo(userRes);
+                          showToast('Logged out successfully.', 'success');
+                        } catch (err) {
+                          showToast(`Logout failed: ${err.message}`, 'error');
+                        }
                       }}
                     >
                       <X size={14} /> Log Out
@@ -2268,459 +2279,459 @@ export default function App() {
                 }
               }
               return messages.map((msg, idx) => (
-            <div key={idx} className="message-row">
-              {msg.role === 'system' ? (
-                <div className="message-system">
-                  <Folder size={14} color="#38bdf8" />
-                  <span>{msg.content}</span>
-                </div>
-              ) : msg.role === 'user' ? (
-                <div className="message-user" style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '10px' }}>
-                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    {msg.content && <span>{msg.content}</span>}
-                    {msg.audio && (
-                      <div className="message-audio-player">
-                        <div className="audio-player-meta">
-                          <Mic size={12} color="#38bdf8" />
-                          <span>Voice Note ({msg.audio.durationFormatted})</span>
+                <div key={idx} className="message-row">
+                  {msg.role === 'system' ? (
+                    <div className="message-system">
+                      <Folder size={14} color="#38bdf8" />
+                      <span>{msg.content}</span>
+                    </div>
+                  ) : msg.role === 'user' ? (
+                    <div className="message-user" style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '10px' }}>
+                      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        {msg.content && <span>{msg.content}</span>}
+                        {msg.audio && (
+                          <div className="message-audio-player">
+                            <div className="audio-player-meta">
+                              <Mic size={12} color="#38bdf8" />
+                              <span>Voice Note ({msg.audio.durationFormatted})</span>
+                            </div>
+                            <audio controls src={msg.audio.url} className="chat-audio-element" />
+                          </div>
+                        )}
+                        {msg.files && msg.files.length > 0 && (
+                          <div className="message-attached-files-row">
+                            {msg.files.map((f, fIdx) => (
+                              f.isImage ? (
+                                <div key={fIdx} className="message-image-thumb-box">
+                                  <img src={f.previewUrl} alt={f.name} className="message-user-img" />
+                                  <span className="message-img-caption" title={f.name}>{f.name}</span>
+                                </div>
+                              ) : (
+                                <div key={fIdx} className="message-file-badge">
+                                  <FileText size={12} color="#38bdf8" />
+                                  <span className="message-file-name" title={f.name}>{f.name}</span>
+                                  <span className="message-file-size">({f.sizeFormatted})</span>
+                                </div>
+                              )
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      {activeSessionId && (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                          {idx > 0 && (
+                            <button
+                              type="button"
+                              className="btn-revert-turn"
+                              onClick={() => handleForkFromTurn(msg.stepIndex ?? (idx > 0 ? idx - 1 : 0))}
+                              title="Branch conversation from this turn into a new session"
+                            >
+                              <GitBranch size={10} /> Fork
+                            </button>
+                          )}
+                          {idx === lastUserIdx && (
+                            <button
+                              type="button"
+                              className="btn-revert-turn"
+                              onClick={handleRevertLastTurn}
+                              title="Undo this message and restore it to the input box"
+                            >
+                              <RotateCcw size={10} /> Revert
+                            </button>
+                          )}
                         </div>
-                        <audio controls src={msg.audio.url} className="chat-audio-element" />
-                      </div>
-                    )}
-                    {msg.files && msg.files.length > 0 && (
-                      <div className="message-attached-files-row">
-                        {msg.files.map((f, fIdx) => (
-                          f.isImage ? (
-                            <div key={fIdx} className="message-image-thumb-box">
-                              <img src={f.previewUrl} alt={f.name} className="message-user-img" />
-                              <span className="message-img-caption" title={f.name}>{f.name}</span>
-                            </div>
-                          ) : (
-                            <div key={fIdx} className="message-file-badge">
-                              <FileText size={12} color="#38bdf8" />
-                              <span className="message-file-name" title={f.name}>{f.name}</span>
-                              <span className="message-file-size">({f.sizeFormatted})</span>
-                            </div>
-                          )
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  {activeSessionId && (
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
-                      {idx > 0 && (
-                        <button
-                          type="button"
-                          className="btn-revert-turn"
-                          onClick={() => handleForkFromTurn(msg.stepIndex ?? (idx > 0 ? idx - 1 : 0))}
-                          title="Branch conversation from this turn into a new session"
-                        >
-                          <GitBranch size={10} /> Fork
-                        </button>
                       )}
-                      {idx === lastUserIdx && (
-                        <button
-                          type="button"
-                          className="btn-revert-turn"
-                          onClick={handleRevertLastTurn}
-                          title="Undo this message and restore it to the input box"
-                        >
-                          <RotateCcw size={10} /> Revert
-                        </button>
+                    </div>
+                  ) : (
+                    <div className="message-assistant">
+                      {/* Step-based execution stream (Thinking, Tools, and Content in chronological order) */}
+                      {msg.steps && msg.steps.length > 0 ? (
+                        msg.steps.map((step, sIdx) => {
+                          if (step.type === 'error') {
+                            return (
+                              <div key={sIdx} className="error-card" style={{ padding: '10px 14px', borderRadius: '8px', background: 'rgba(239, 68, 68, 0.12)', border: '1px solid rgba(239, 68, 68, 0.3)', color: '#f87171', fontSize: '13px', margin: '6px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                <AlertCircle size={16} />
+                                <span>{step.content}</span>
+                              </div>
+                            );
+                          }
+
+                          if (step.type === 'exec_error') {
+                            // Parse quota reset time if present
+                            const resetMatch = step.content.match(/Resets in ([^.]+)/);
+                            const quotaMatch = step.content.match(/RESOURCE_EXHAUSTED|quota reached/i);
+                            return (
+                              <div key={sIdx} style={{
+                                padding: '14px 16px',
+                                borderRadius: '10px',
+                                background: 'rgba(239, 68, 68, 0.08)',
+                                border: '1px solid rgba(239, 68, 68, 0.25)',
+                                margin: '8px 0',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '6px'
+                              }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#f87171', fontWeight: 600, fontSize: '13px' }}>
+                                  <AlertCircle size={15} />
+                                  <span>{quotaMatch ? '⚡ Quota Limit Reached' : '❌ Execution Error'}</span>
+                                </div>
+                                <div style={{ color: '#fca5a5', fontSize: '12px', lineHeight: '1.5', wordBreak: 'break-word' }}>
+                                  {step.content}
+                                </div>
+                                {resetMatch && (
+                                  <div style={{ color: '#94a3b8', fontSize: '11px', marginTop: '2px' }}>
+                                    🕐 Quota resets in {resetMatch[1]}. Consider switching to a different model in the toolbar above.
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          }
+
+
+                          if (step.type === 'planner') {
+                            const thinkKey = `${idx}-${step.stepIndex}`;
+                            const extractedImages = step.content ? extractImageReferences(step.content) : [];
+                            return (
+                              <div key={sIdx} className="step-block">
+                                {step.thinking && (
+                                  <div className="thinking-box">
+                                    <div className="thinking-header" onClick={() => toggleThinking(thinkKey)}>
+                                      <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                        <Brain size={14} />
+                                        {isGenerating && idx === messages.length - 1 && !step.content ? 'Reasoning in progress...' : 'Thought Process'}
+                                      </span>
+                                      {collapsedThinking[thinkKey] ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                                    </div>
+                                    {!collapsedThinking[thinkKey] && (
+                                      <div className="thinking-content">{step.thinking}</div>
+                                    )}
+                                  </div>
+                                )}
+                                {step.content && (
+                                  <div className="assistant-text">{step.content}</div>
+                                )}
+                                {extractedImages.length > 0 && (
+                                  <div className="generated-images-container">
+                                    {extractedImages.map((img, iIdx) => {
+                                      const isWebUrl = img.path.startsWith('http://') || img.path.startsWith('https://') || img.path.startsWith('data:');
+                                      return (
+                                        <div key={iIdx} className="generated-image-card">
+                                          <div className="generated-image-header">
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                              <ImageIcon size={14} color="#38bdf8" />
+                                              <span className="generated-image-title">Generated Image: {img.alt}</span>
+                                            </div>
+                                            <button
+                                              type="button"
+                                              className="btn-copy-image-path"
+                                              onClick={() => {
+                                                navigator.clipboard.writeText(img.path);
+                                                showToast('Image path copied to clipboard', 'success');
+                                              }}
+                                              title="Copy image path"
+                                            >
+                                              <Copy size={12} /> Copy Path
+                                            </button>
+                                          </div>
+                                          <div className="generated-image-filepath-box">
+                                            <code className="image-filepath-text">{img.path}</code>
+                                          </div>
+                                          <div className="generated-image-preview">
+                                            <img
+                                              src={img.previewUrl || img.path}
+                                              alt={img.alt}
+                                              className="response-img"
+                                              onError={(e) => {
+                                                if (!e.currentTarget.dataset.retried) {
+                                                  e.currentTarget.dataset.retried = 'true';
+                                                  const clean = img.path.replace(/^file:\/\//, '');
+                                                  e.currentTarget.src = `/api/serve-file?path=${encodeURIComponent(clean)}`;
+                                                } else {
+                                                  e.currentTarget.style.display = 'none';
+                                                }
+                                              }}
+                                            />
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          }
+
+                          if (step.type === 'generate_image') {
+                            return (
+                              <div key={sIdx} className="step-block">
+                                <div className="generated-image-card">
+                                  <div className="generated-image-header">
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                      <ImageIcon size={14} color="#38bdf8" />
+                                      <span className="generated-image-title">Generated Image: {step.imageName || 'Image'}</span>
+                                    </div>
+                                    {step.filePath && (
+                                      <button
+                                        type="button"
+                                        className="btn-copy-image-path"
+                                        onClick={() => {
+                                          navigator.clipboard.writeText(step.filePath);
+                                          showToast('Image path copied to clipboard', 'success');
+                                        }}
+                                        title="Copy image path"
+                                      >
+                                        <Copy size={12} /> Copy Path
+                                      </button>
+                                    )}
+                                  </div>
+                                  {step.prompt && (
+                                    <div style={{ fontSize: '12px', color: '#94a3b8', fontStyle: 'italic', marginBottom: '8px' }}>
+                                      "{step.prompt}"
+                                    </div>
+                                  )}
+                                  {step.filePath && (
+                                    <div className="generated-image-filepath-box">
+                                      <code className="image-filepath-text">{step.filePath}</code>
+                                    </div>
+                                  )}
+                                  {(step.previewUrl || step.filePath) ? (
+                                    <div className="generated-image-preview">
+                                      <img
+                                        src={step.previewUrl || `/api/serve-file?path=${encodeURIComponent(step.filePath.replace(/^file:\/\//, ''))}`}
+                                        alt={step.imageName || 'Generated image'}
+                                        className="response-img"
+                                        onError={(e) => {
+                                          if (step.filePath && !e.currentTarget.dataset.retried) {
+                                            e.currentTarget.dataset.retried = 'true';
+                                            e.currentTarget.src = `/api/serve-file?path=${encodeURIComponent(step.filePath.replace(/^file:\/\//, ''))}`;
+                                          }
+                                        }}
+                                      />
+                                    </div>
+                                  ) : (
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontSize: '13px', padding: '12px 0' }}>
+                                      <Loader2 size={15} className="spin" color="#38bdf8" />
+                                      <span>Generating image, please wait...</span>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          }
+
+                          if (step.type === 'tool') {
+                            const toolKey = `${idx}-${step.stepIndex}`;
+                            const isFailed = Boolean(step.error || step.status === 'CORTEX_STEP_STATUS_ERROR');
+                            // Failed tools default to EXPANDED so the user immediately sees the error!
+                            const isCollapsed = collapsedTools[toolKey] !== undefined ? collapsedTools[toolKey] : false;
+
+                            // True approval required ONLY if step is specifically waiting on user OR proposed in OFF mode with no output
+                            const isAwaitingApproval = !step.output && !step.error && (
+                              step.status === 'CORTEX_STEP_STATUS_WAITING' ||
+                              step.isWaiting ||
+                              (step.isProposed && autoExecutionPolicy === 'OFF' && step.status !== 'CORTEX_STEP_STATUS_RUNNING')
+                            );
+                            const isRunning = !step.output && !step.error && !isAwaitingApproval && (
+                              step.status === 'CORTEX_STEP_STATUS_RUNNING' ||
+                              (isGenerating && sIdx === (msg.steps || []).length - 1 && step.status !== 'CORTEX_STEP_STATUS_ERROR' && step.status !== 'CORTEX_STEP_STATUS_DONE')
+                            );
+                            return (
+                              <div key={sIdx} className={`tool-box ${isFailed ? 'tool-failed' : ''}`} style={isFailed ? { borderColor: 'rgba(239, 68, 68, 0.4)' } : {}}>
+                                <div
+                                  className="tool-header"
+                                  onClick={() => toggleTool(toolKey)}
+                                  style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                                >
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
+                                    {isFailed ? (
+                                      <AlertCircle size={14} color="#f87171" style={{ flexShrink: 0 }} />
+                                    ) : step.toolType === 'command' ? (
+                                      <Terminal size={14} style={{ flexShrink: 0 }} />
+                                    ) : step.toolType === 'read' ? (
+                                      <FileText size={14} color="#38bdf8" style={{ flexShrink: 0 }} />
+                                    ) : step.toolType === 'list' ? (
+                                      <Folder size={14} color="#38bdf8" style={{ flexShrink: 0 }} />
+                                    ) : step.toolType === 'find' ? (
+                                      <Search size={14} color="#f59e0b" style={{ flexShrink: 0 }} />
+                                    ) : step.toolType === 'edit' ? (
+                                      <Code size={14} color="#a855f7" style={{ flexShrink: 0 }} />
+                                    ) : step.toolType === 'search' ? (
+                                      <Search size={14} color="#34d399" style={{ flexShrink: 0 }} />
+                                    ) : (
+                                      <Terminal size={14} style={{ flexShrink: 0 }} />
+                                    )}
+                                    <span style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                                      {step.label || (step.command ? `Terminal: ${step.command}` : 'Tool Execution')}
+                                    </span>
+                                    {isFailed && (
+                                      <span style={{ fontSize: '11px', background: 'rgba(239, 68, 68, 0.2)', color: '#f87171', padding: '1px 6px', borderRadius: '4px', fontWeight: 600, flexShrink: 0 }}>
+                                        Failed
+                                      </span>
+                                    )}
+                                  </div>
+                                  {(step.output || step.diff || step.error) && (
+                                    <span style={{ color: '#64748b' }}>
+                                      {isCollapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                                    </span>
+                                  )}
+                                </div>
+                                {!isCollapsed && (
+                                  <>
+                                    {step.error && (
+                                      <div style={{ padding: '8px 12px', background: 'rgba(239, 68, 68, 0.12)', borderLeft: '3px solid #ef4444', color: '#fca5a5', fontSize: '12px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: '4px 8px', borderRadius: '0 4px 4px 0' }}>
+                                        <div style={{ fontWeight: 600, marginBottom: '2px', color: '#ef4444' }}>Execution Error:</div>
+                                        {step.error}
+                                      </div>
+                                    )}
+                                    {step.diff && (
+                                      <div className="tool-content">{step.diff}</div>
+                                    )}
+                                    {step.output && (!step.error || step.output !== `Search failed: ${step.error}`) && (
+                                      <div className="tool-content">{step.output}</div>
+                                    )}
+                                    {step.toolType === 'command' && isRunning && (
+                                      <div style={{ padding: '8px 12px', fontSize: '12px', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                        <Loader2 size={12} className="spin" /> Executing command in workspace...
+                                      </div>
+                                    )}
+                                    {step.toolType === 'command' && isAwaitingApproval && (
+                                      <div className="command-action-bar">
+                                        <span className="approval-badge">
+                                          <Terminal size={12} /> Execution approval required
+                                        </span>
+                                        <div className="action-buttons">
+                                          <button
+                                            type="button"
+                                            className="btn-approve"
+                                            onClick={() => handleApproveCommand(step.stepIndex, 'PERMISSION_SCOPE_ONCE')}
+                                            title="Execute this command once"
+                                          >
+                                            <Play size={12} /> Run Once
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="btn-approve-conversation"
+                                            onClick={() => handleApproveCommand(step.stepIndex, 'PERMISSION_SCOPE_CONVERSATION')}
+                                            title="Always allow this command in this conversation"
+                                          >
+                                            <Check size={12} /> Always in Chat
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="btn-approve-workspace"
+                                            onClick={() => handleApproveCommand(step.stepIndex, 'PERMISSION_SCOPE_WORKSPACE')}
+                                            title="Always allow this command in this workspace"
+                                          >
+                                            <ShieldCheck size={12} /> Always in Workspace
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="btn-reject"
+                                            onClick={() => handleCancelStep(step.stepIndex)}
+                                            title="Cancel this command"
+                                          >
+                                            <X size={12} /> Cancel
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </>
+                                )}
+                              </div>
+                            );
+                          }
+
+                          if (step.type === 'notifyUser') {
+                            return (
+                              <div key={sIdx} className={`notify-user-card ${step.isBlocking ? 'blocking' : ''}`}>
+                                <div className="notify-user-header">
+                                  <div className="notify-user-title">
+                                    <Bell size={16} color={step.isBlocking ? '#f59e0b' : '#38bdf8'} />
+                                    <span>{step.isBlocking ? 'Action Required: Plan Review & Feedback' : 'Agent Notification'}</span>
+                                  </div>
+                                  {step.isBlocking ? (
+                                    <span className="blocking-tag">⏸️ Review Required</span>
+                                  ) : (
+                                    <span className="notice-tag">ℹ️ Notice</span>
+                                  )}
+                                </div>
+
+                                {step.content && (
+                                  <div className="notify-user-content">{step.content}</div>
+                                )}
+
+                                {step.reviewUris && step.reviewUris.length > 0 && (
+                                  <div className="notify-uris-list">
+                                    <span className="uris-label">Artifacts / Files to Review:</span>
+                                    <div className="uris-chips">
+                                      {step.reviewUris.map((uri, uIdx) => (
+                                        <span key={uIdx} className="uri-chip" title={uri}>
+                                          <FileText size={12} />
+                                          {uri.split('/').filter(Boolean).pop() || uri}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {step.isBlocking && (
+                                  <div className="notify-actions-bar">
+                                    <button
+                                      type="button"
+                                      className="btn-proceed"
+                                      onClick={handleResolvePlan}
+                                    >
+                                      <Check size={14} /> Proceed with Plan
+                                    </button>
+                                    <span className="notify-hint">Or send a reply below with suggestions</span>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          }
+
+                          return null;
+                        })
+                      ) : (
+                        /* Fallback for legacy messages or waiting state */
+                        <>
+                          {msg.thinking && (
+                            <div className="thinking-box">
+                              <div className="thinking-header" onClick={() => toggleThinking(idx)}>
+                                <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                  <Brain size={14} />
+                                  Thought Process
+                                </span>
+                                {collapsedThinking[idx] ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
+                              </div>
+                              {!collapsedThinking[idx] && (
+                                <div className="thinking-content">{msg.thinking}</div>
+                              )}
+                            </div>
+                          )}
+                          {msg.tools && msg.tools.map((tool, tIdx) => (
+                            <div key={tIdx} className="tool-box">
+                              <div className="tool-header">
+                                <Terminal size={14} />
+                                <span>{tool.label || tool.command}</span>
+                              </div>
+                              {tool.output && <div className="tool-content">{tool.output}</div>}
+                            </div>
+                          ))}
+                          {msg.content && <div className="assistant-text">{msg.content}</div>}
+                          {isGenerating && idx === messages.length - 1 && (
+                            <div style={{ color: '#64748b', fontSize: '13px', fontStyle: 'italic' }}>
+                              Waiting for response...
+                            </div>
+                          )}
+                        </>
                       )}
                     </div>
                   )}
                 </div>
-              ) : (
-                <div className="message-assistant">
-                  {/* Step-based execution stream (Thinking, Tools, and Content in chronological order) */}
-                  {msg.steps && msg.steps.length > 0 ? (
-                    msg.steps.map((step, sIdx) => {
-                      if (step.type === 'error') {
-                        return (
-                          <div key={sIdx} className="error-card" style={{ padding: '10px 14px', borderRadius: '8px', background: 'rgba(239, 68, 68, 0.12)', border: '1px solid rgba(239, 68, 68, 0.3)', color: '#f87171', fontSize: '13px', margin: '6px 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <AlertCircle size={16} />
-                            <span>{step.content}</span>
-                          </div>
-                        );
-                      }
-
-                      if (step.type === 'exec_error') {
-                        // Parse quota reset time if present
-                        const resetMatch = step.content.match(/Resets in ([^.]+)/);
-                        const quotaMatch = step.content.match(/RESOURCE_EXHAUSTED|quota reached/i);
-                        return (
-                          <div key={sIdx} style={{
-                            padding: '14px 16px',
-                            borderRadius: '10px',
-                            background: 'rgba(239, 68, 68, 0.08)',
-                            border: '1px solid rgba(239, 68, 68, 0.25)',
-                            margin: '8px 0',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '6px'
-                          }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#f87171', fontWeight: 600, fontSize: '13px' }}>
-                              <AlertCircle size={15} />
-                              <span>{quotaMatch ? '⚡ Quota Limit Reached' : '❌ Execution Error'}</span>
-                            </div>
-                            <div style={{ color: '#fca5a5', fontSize: '12px', lineHeight: '1.5', wordBreak: 'break-word' }}>
-                              {step.content}
-                            </div>
-                            {resetMatch && (
-                              <div style={{ color: '#94a3b8', fontSize: '11px', marginTop: '2px' }}>
-                                🕐 Quota resets in {resetMatch[1]}. Consider switching to a different model in the toolbar above.
-                              </div>
-                            )}
-                          </div>
-                        );
-                      }
-
-
-                      if (step.type === 'planner') {
-                        const thinkKey = `${idx}-${step.stepIndex}`;
-                        const extractedImages = step.content ? extractImageReferences(step.content) : [];
-                        return (
-                          <div key={sIdx} className="step-block">
-                            {step.thinking && (
-                              <div className="thinking-box">
-                                <div className="thinking-header" onClick={() => toggleThinking(thinkKey)}>
-                                  <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                    <Brain size={14} />
-                                    {isGenerating && idx === messages.length - 1 && !step.content ? 'Reasoning in progress...' : 'Thought Process'}
-                                  </span>
-                                  {collapsedThinking[thinkKey] ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
-                                </div>
-                                {!collapsedThinking[thinkKey] && (
-                                  <div className="thinking-content">{step.thinking}</div>
-                                )}
-                              </div>
-                            )}
-                            {step.content && (
-                              <div className="assistant-text">{step.content}</div>
-                            )}
-                            {extractedImages.length > 0 && (
-                              <div className="generated-images-container">
-                                {extractedImages.map((img, iIdx) => {
-                                  const isWebUrl = img.path.startsWith('http://') || img.path.startsWith('https://') || img.path.startsWith('data:');
-                                  return (
-                                    <div key={iIdx} className="generated-image-card">
-                                      <div className="generated-image-header">
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                          <ImageIcon size={14} color="#38bdf8" />
-                                          <span className="generated-image-title">Generated Image: {img.alt}</span>
-                                        </div>
-                                        <button
-                                          type="button"
-                                          className="btn-copy-image-path"
-                                          onClick={() => {
-                                            navigator.clipboard.writeText(img.path);
-                                            showToast('Image path copied to clipboard', 'success');
-                                          }}
-                                          title="Copy image path"
-                                        >
-                                          <Copy size={12} /> Copy Path
-                                        </button>
-                                      </div>
-                                      <div className="generated-image-filepath-box">
-                                        <code className="image-filepath-text">{img.path}</code>
-                                      </div>
-                                      <div className="generated-image-preview">
-                                        <img
-                                          src={img.previewUrl || img.path}
-                                          alt={img.alt}
-                                          className="response-img"
-                                          onError={(e) => {
-                                            if (!e.currentTarget.dataset.retried) {
-                                              e.currentTarget.dataset.retried = 'true';
-                                              const clean = img.path.replace(/^file:\/\//, '');
-                                              e.currentTarget.src = `/api/serve-file?path=${encodeURIComponent(clean)}`;
-                                            } else {
-                                              e.currentTarget.style.display = 'none';
-                                            }
-                                          }}
-                                        />
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      }
-
-                      if (step.type === 'generate_image') {
-                        return (
-                          <div key={sIdx} className="step-block">
-                            <div className="generated-image-card">
-                              <div className="generated-image-header">
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                                  <ImageIcon size={14} color="#38bdf8" />
-                                  <span className="generated-image-title">Generated Image: {step.imageName || 'Image'}</span>
-                                </div>
-                                {step.filePath && (
-                                  <button
-                                    type="button"
-                                    className="btn-copy-image-path"
-                                    onClick={() => {
-                                      navigator.clipboard.writeText(step.filePath);
-                                      showToast('Image path copied to clipboard', 'success');
-                                    }}
-                                    title="Copy image path"
-                                  >
-                                    <Copy size={12} /> Copy Path
-                                  </button>
-                                )}
-                              </div>
-                              {step.prompt && (
-                                <div style={{ fontSize: '12px', color: '#94a3b8', fontStyle: 'italic', marginBottom: '8px' }}>
-                                  "{step.prompt}"
-                                </div>
-                              )}
-                              {step.filePath && (
-                                <div className="generated-image-filepath-box">
-                                  <code className="image-filepath-text">{step.filePath}</code>
-                                </div>
-                              )}
-                              {(step.previewUrl || step.filePath) ? (
-                                <div className="generated-image-preview">
-                                  <img
-                                    src={step.previewUrl || `/api/serve-file?path=${encodeURIComponent(step.filePath.replace(/^file:\/\//, ''))}`}
-                                    alt={step.imageName || 'Generated image'}
-                                    className="response-img"
-                                    onError={(e) => {
-                                      if (step.filePath && !e.currentTarget.dataset.retried) {
-                                        e.currentTarget.dataset.retried = 'true';
-                                        e.currentTarget.src = `/api/serve-file?path=${encodeURIComponent(step.filePath.replace(/^file:\/\//, ''))}`;
-                                      }
-                                    }}
-                                  />
-                                </div>
-                              ) : (
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#94a3b8', fontSize: '13px', padding: '12px 0' }}>
-                                  <Loader2 size={15} className="spin" color="#38bdf8" />
-                                  <span>Generating image, please wait...</span>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      }
-
-                      if (step.type === 'tool') {
-                        const toolKey = `${idx}-${step.stepIndex}`;
-                        const isFailed = Boolean(step.error || step.status === 'CORTEX_STEP_STATUS_ERROR');
-                        // Failed tools default to EXPANDED so the user immediately sees the error!
-                        const isCollapsed = collapsedTools[toolKey] !== undefined ? collapsedTools[toolKey] : false;
-
-                        // True approval required ONLY if step is specifically waiting on user OR proposed in OFF mode with no output
-                        const isAwaitingApproval = !step.output && !step.error && (
-                          step.status === 'CORTEX_STEP_STATUS_WAITING' ||
-                          step.isWaiting ||
-                          (step.isProposed && autoExecutionPolicy === 'OFF' && step.status !== 'CORTEX_STEP_STATUS_RUNNING')
-                        );
-                        const isRunning = !step.output && !step.error && !isAwaitingApproval && (
-                          step.status === 'CORTEX_STEP_STATUS_RUNNING' ||
-                          (isGenerating && sIdx === (msg.steps || []).length - 1 && step.status !== 'CORTEX_STEP_STATUS_ERROR' && step.status !== 'CORTEX_STEP_STATUS_DONE')
-                        );
-                        return (
-                          <div key={sIdx} className={`tool-box ${isFailed ? 'tool-failed' : ''}`} style={isFailed ? { borderColor: 'rgba(239, 68, 68, 0.4)' } : {}}>
-                            <div
-                              className="tool-header"
-                              onClick={() => toggleTool(toolKey)}
-                              style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-                            >
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
-                                {isFailed ? (
-                                  <AlertCircle size={14} color="#f87171" style={{ flexShrink: 0 }} />
-                                ) : step.toolType === 'command' ? (
-                                  <Terminal size={14} style={{ flexShrink: 0 }} />
-                                ) : step.toolType === 'read' ? (
-                                  <FileText size={14} color="#38bdf8" style={{ flexShrink: 0 }} />
-                                ) : step.toolType === 'list' ? (
-                                  <Folder size={14} color="#38bdf8" style={{ flexShrink: 0 }} />
-                                ) : step.toolType === 'find' ? (
-                                  <Search size={14} color="#f59e0b" style={{ flexShrink: 0 }} />
-                                ) : step.toolType === 'edit' ? (
-                                  <Code size={14} color="#a855f7" style={{ flexShrink: 0 }} />
-                                ) : step.toolType === 'search' ? (
-                                  <Search size={14} color="#34d399" style={{ flexShrink: 0 }} />
-                                ) : (
-                                  <Terminal size={14} style={{ flexShrink: 0 }} />
-                                )}
-                                <span style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
-                                  {step.label || (step.command ? `Terminal: ${step.command}` : 'Tool Execution')}
-                                </span>
-                                {isFailed && (
-                                  <span style={{ fontSize: '11px', background: 'rgba(239, 68, 68, 0.2)', color: '#f87171', padding: '1px 6px', borderRadius: '4px', fontWeight: 600, flexShrink: 0 }}>
-                                    Failed
-                                  </span>
-                                )}
-                              </div>
-                              {(step.output || step.diff || step.error) && (
-                                <span style={{ color: '#64748b' }}>
-                                  {isCollapsed ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
-                                </span>
-                              )}
-                            </div>
-                            {!isCollapsed && (
-                              <>
-                                {step.error && (
-                                  <div style={{ padding: '8px 12px', background: 'rgba(239, 68, 68, 0.12)', borderLeft: '3px solid #ef4444', color: '#fca5a5', fontSize: '12px', whiteSpace: 'pre-wrap', wordBreak: 'break-word', margin: '4px 8px', borderRadius: '0 4px 4px 0' }}>
-                                    <div style={{ fontWeight: 600, marginBottom: '2px', color: '#ef4444' }}>Execution Error:</div>
-                                    {step.error}
-                                  </div>
-                                )}
-                                {step.diff && (
-                                  <div className="tool-content">{step.diff}</div>
-                                )}
-                                {step.output && (!step.error || step.output !== `Search failed: ${step.error}`) && (
-                                  <div className="tool-content">{step.output}</div>
-                                )}
-                                {step.toolType === 'command' && isRunning && (
-                                  <div style={{ padding: '8px 12px', fontSize: '12px', color: '#94a3b8', display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                    <Loader2 size={12} className="spin" /> Executing command in workspace...
-                                  </div>
-                                )}
-                                {step.toolType === 'command' && isAwaitingApproval && (
-                                  <div className="command-action-bar">
-                                    <span className="approval-badge">
-                                      <Terminal size={12} /> Execution approval required
-                                    </span>
-                                    <div className="action-buttons">
-                                      <button
-                                        type="button"
-                                        className="btn-approve"
-                                        onClick={() => handleApproveCommand(step.stepIndex, 'PERMISSION_SCOPE_ONCE')}
-                                        title="Execute this command once"
-                                      >
-                                        <Play size={12} /> Run Once
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="btn-approve-conversation"
-                                        onClick={() => handleApproveCommand(step.stepIndex, 'PERMISSION_SCOPE_CONVERSATION')}
-                                        title="Always allow this command in this conversation"
-                                      >
-                                        <Check size={12} /> Always in Chat
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="btn-approve-workspace"
-                                        onClick={() => handleApproveCommand(step.stepIndex, 'PERMISSION_SCOPE_WORKSPACE')}
-                                        title="Always allow this command in this workspace"
-                                      >
-                                        <ShieldCheck size={12} /> Always in Workspace
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="btn-reject"
-                                        onClick={() => handleCancelStep(step.stepIndex)}
-                                        title="Cancel this command"
-                                      >
-                                        <X size={12} /> Cancel
-                                      </button>
-                                    </div>
-                                  </div>
-                                )}
-                              </>
-                            )}
-                          </div>
-                        );
-                      }
-
-                      if (step.type === 'notifyUser') {
-                        return (
-                          <div key={sIdx} className={`notify-user-card ${step.isBlocking ? 'blocking' : ''}`}>
-                            <div className="notify-user-header">
-                              <div className="notify-user-title">
-                                <Bell size={16} color={step.isBlocking ? '#f59e0b' : '#38bdf8'} />
-                                <span>{step.isBlocking ? 'Action Required: Plan Review & Feedback' : 'Agent Notification'}</span>
-                              </div>
-                              {step.isBlocking ? (
-                                <span className="blocking-tag">⏸️ Review Required</span>
-                              ) : (
-                                <span className="notice-tag">ℹ️ Notice</span>
-                              )}
-                            </div>
-
-                            {step.content && (
-                              <div className="notify-user-content">{step.content}</div>
-                            )}
-
-                            {step.reviewUris && step.reviewUris.length > 0 && (
-                              <div className="notify-uris-list">
-                                <span className="uris-label">Artifacts / Files to Review:</span>
-                                <div className="uris-chips">
-                                  {step.reviewUris.map((uri, uIdx) => (
-                                    <span key={uIdx} className="uri-chip" title={uri}>
-                                      <FileText size={12} />
-                                      {uri.split('/').filter(Boolean).pop() || uri}
-                                    </span>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-
-                            {step.isBlocking && (
-                              <div className="notify-actions-bar">
-                                <button
-                                  type="button"
-                                  className="btn-proceed"
-                                  onClick={handleResolvePlan}
-                                >
-                                  <Check size={14} /> Proceed with Plan
-                                </button>
-                                <span className="notify-hint">Or send a reply below with suggestions</span>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      }
-
-                      return null;
-                    })
-                  ) : (
-                    /* Fallback for legacy messages or waiting state */
-                    <>
-                      {msg.thinking && (
-                        <div className="thinking-box">
-                          <div className="thinking-header" onClick={() => toggleThinking(idx)}>
-                            <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                              <Brain size={14} />
-                              Thought Process
-                            </span>
-                            {collapsedThinking[idx] ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
-                          </div>
-                          {!collapsedThinking[idx] && (
-                            <div className="thinking-content">{msg.thinking}</div>
-                          )}
-                        </div>
-                      )}
-                      {msg.tools && msg.tools.map((tool, tIdx) => (
-                        <div key={tIdx} className="tool-box">
-                          <div className="tool-header">
-                            <Terminal size={14} />
-                            <span>{tool.label || tool.command}</span>
-                          </div>
-                          {tool.output && <div className="tool-content">{tool.output}</div>}
-                        </div>
-                      ))}
-                      {msg.content && <div className="assistant-text">{msg.content}</div>}
-                      {isGenerating && idx === messages.length - 1 && (
-                        <div style={{ color: '#64748b', fontSize: '13px', fontStyle: 'italic' }}>
-                          Waiting for response...
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
-          ));
-        })()
-      )}
+              ));
+            })()
+          )}
           <div ref={messagesEndRef} />
         </div>
 

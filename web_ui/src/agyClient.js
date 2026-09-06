@@ -1871,4 +1871,22 @@ export class AntigravityBrowserClient {
       return null;
     }
   }
+
+  // 23. Log out the current user
+  async authLogout() {
+    // Always fetch a fresh CSRF token before logout
+    await this.initCsrfToken();
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/AuthLogout`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: this.encodeFrame({})
+    });
+    // grpc-status: 0 means success
+    const status = res.headers.get('grpc-status') || '0';
+    if (status !== '0') {
+      const msg = res.headers.get('grpc-message') || 'Logout failed';
+      throw new Error(msg);
+    }
+    return true;
+  }
 }
