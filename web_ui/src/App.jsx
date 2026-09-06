@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   MessageSquare,
   Plus,
@@ -27,7 +27,11 @@ import {
   AlertCircle,
   ShieldCheck,
   CheckCircle2,
-  Info
+  Info,
+  Activity,
+  Copy,
+  Clock,
+  Ban
 } from 'lucide-react';
 import { AntigravityBrowserClient } from './agyClient';
 
@@ -69,8 +73,13 @@ export default function App() {
   const [workspaceDir, setWorkspaceDir] = useState('/home/cat/agy_cli_hub');
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [modalMode, setModalMode] = useState('new');
-  const [tempCustomPath, setTempCustomPath] = useState('/home/cat/agy_cli_hub');
+  const [tempCustomPath, setTempCustomPath] = useState('');
   const [tempSelectedProjectId, setTempSelectedProjectId] = useState('default-cli-project');
+  const [showTasksModal, setShowTasksModal] = useState(false);
+  const [tasksFilter, setTasksFilter] = useState('ALL');
+  const [tasksSearch, setTasksSearch] = useState('');
+  const [expandedModalTasks, setExpandedModalTasks] = useState({});
+  const [copiedStepIndex, setCopiedStepIndex] = useState(null);
 
   const [messages, setMessages] = useState([]);
   const [inputPrompt, setInputPrompt] = useState('');
@@ -679,6 +688,100 @@ export default function App() {
     }));
   };
 
+  // Extract all tasks / tool executions dynamically from messages
+  const allTasks = useMemo(() => {
+    const list = [];
+    messages.forEach((msg) => {
+      if (msg.role === 'assistant' && Array.isArray(msg.steps)) {
+        msg.steps.forEach(step => {
+          if (step.type === 'tool' || step.toolType) {
+            const rawStatus = step.status || '';
+            let status = 'DONE';
+            if (step.error || rawStatus.includes('ERROR') || rawStatus.includes('FAIL')) status = 'ERROR';
+            else if (step.isRunning || rawStatus.includes('RUNNING')) status = 'RUNNING';
+            else if (step.isWaiting || rawStatus.includes('WAIT')) status = 'WAITING';
+            else if (rawStatus.includes('CANCEL')) status = 'CANCELLED';
+
+            list.push({
+              stepIndex: step.stepIndex,
+              type: step.toolType || 'tool',
+              label: step.label || (step.command ? `Terminal: ${step.command}` : 'Tool Execution'),
+              command: step.command,
+              output: step.output || '',
+              diff: step.diff || '',
+              error: step.error || '',
+              status,
+              rawStatus
+            });
+          }
+        });
+      }
+    });
+    return list;
+  }, [messages]);
+
+  const runningTasks = useMemo(() => allTasks.filter(t => t.status === 'RUNNING'), [allTasks]);
+  const runningTasksCount = runningTasks.length;
+
+  const filteredTasks = useMemo(() => {
+    return allTasks.filter(task => {
+      if (tasksFilter === 'RUNNING' && task.status !== 'RUNNING') return false;
+      if (tasksFilter === 'COMMANDS' && task.type !== 'command') return false;
+      if (tasksFilter === 'FILES' && task.type !== 'read' && task.type !== 'edit' && task.type !== 'list') return false;
+      if (tasksFilter === 'ERRORS' && task.status !== 'ERROR' && !task.error) return false;
+
+      if (tasksSearch.trim()) {
+        const q = tasksSearch.toLowerCase();
+        const matchLabel = (task.label || '').toLowerCase().includes(q);
+        const matchOutput = (task.output || '').toLowerCase().includes(q);
+        const matchType = (task.type || '').toLowerCase().includes(q);
+        return matchLabel || matchOutput || matchType;
+      }
+      return true;
+    });
+  }, [allTasks, tasksFilter, tasksSearch]);
+
+  const handleKillTask = async (stepIndex) => {
+    if (!activeSessionId) return;
+    try {
+      const ok = await client.cancelCascadeSteps(activeSessionId, [stepIndex]);
+      if (ok) {
+        showToast(`Stopped process #${stepIndex}`, 'info');
+        setMessages(prev => prev.map(msg => {
+          if (msg.role !== 'assistant' || !Array.isArray(msg.steps)) return msg;
+          return {
+            ...msg,
+            steps: msg.steps.map(s => {
+              if (s.stepIndex === stepIndex) {
+                return { ...s, status: 'CORTEX_STEP_STATUS_CANCELLED', isRunning: false, error: 'Cancelled by user' };
+              }
+              return s;
+            })
+          };
+        }));
+      } else {
+        showToast(`Failed to stop process #${stepIndex}`, 'error');
+      }
+    } catch (err) {
+      console.error('Failed to kill task:', err);
+      showToast(`Error stopping task: ${err.message}`, 'error');
+    }
+  };
+
+  const toggleModalTask = (stepIndex) => {
+    setExpandedModalTasks(prev => ({
+      ...prev,
+      [stepIndex]: !prev[stepIndex]
+    }));
+  };
+
+  const copyTaskOutput = (stepIndex, text) => {
+    if (!text) return;
+    navigator.clipboard.writeText(text);
+    setCopiedStepIndex(stepIndex);
+    setTimeout(() => setCopiedStepIndex(null), 2000);
+  };
+
   const activeModelObj = models.find(m => m.modelEnum === selectedModel);
 
   return (
@@ -829,6 +932,28 @@ export default function App() {
                 <ChevronDown size={12} color="#64748b" />
               )}
             </div>
+
+            {/* Tasks & Process Activity Badge */}
+            {activeSessionId && (
+              <button
+                type="button"
+                className={`tasks-activity-btn ${runningTasksCount > 0 ? 'has-running' : ''}`}
+                onClick={() => setShowTasksModal(true)}
+                title="Inspect running processes and executed commands (/tasks)"
+              >
+                {runningTasksCount > 0 ? (
+                  <>
+                    <Loader2 size={13} className="spin" />
+                    <span className="task-running-badge">{runningTasksCount} Running</span>
+                  </>
+                ) : (
+                  <>
+                    <Activity size={13} color="#38bdf8" />
+                    <span>{allTasks.length} {allTasks.length === 1 ? 'Task' : 'Tasks'}</span>
+                  </>
+                )}
+              </button>
+            )}
 
             {activeModelObj?.quotaFraction !== undefined && (
               <div className="status-badge" style={{ color: '#38bdf8' }}>
@@ -1230,6 +1355,19 @@ export default function App() {
 
         {/* Prompt Input Box */}
         <div className="input-area">
+          {runningTasksCount > 0 && (
+            <div className="running-tasks-banner" onClick={() => setShowTasksModal(true)}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Loader2 size={14} className="spin" color="#fbbf24" />
+                <span>
+                  <strong>{runningTasksCount}</strong> background {runningTasksCount === 1 ? 'command' : 'commands'} currently executing
+                </span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span className="view-tasks-link">View Progress & Stop &rarr;</span>
+              </div>
+            </div>
+          )}
           <form className="input-box-wrapper" onSubmit={handleSendMessage}>
             <textarea
               className="chat-input"
@@ -1362,6 +1500,209 @@ export default function App() {
               >
                 {modalMode === 'new' ? 'Start Session' : 'Apply Workspace Change'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tasks & Process Inspector Modal */}
+      {showTasksModal && (
+        <div className="modal-overlay" onClick={() => setShowTasksModal(false)}>
+          <div className="tasks-modal-content" onClick={e => e.stopPropagation()}>
+            <div className="tasks-modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <Activity size={20} color="#38bdf8" />
+                <div>
+                  <h3 style={{ margin: 0, fontSize: '16px', color: '#f1f5f9' }}>Tasks & Process Inspector</h3>
+                  <span style={{ fontSize: '11.5px', color: '#64748b' }}>
+                    Inspect commands, background processes, outputs, and stop active tasks
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowTasksModal(false)}
+                style={{ background: 'transparent', border: 'none', color: '#94a3b8', cursor: 'pointer' }}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Toolbar: Filters & Search */}
+            <div className="tasks-modal-toolbar">
+              <div className="tasks-filter-tabs">
+                <button
+                  type="button"
+                  className={`tasks-filter-tab ${tasksFilter === 'ALL' ? 'active' : ''}`}
+                  onClick={() => setTasksFilter('ALL')}
+                >
+                  All ({allTasks.length})
+                </button>
+                <button
+                  type="button"
+                  className={`tasks-filter-tab ${tasksFilter === 'RUNNING' ? 'active' : ''}`}
+                  onClick={() => setTasksFilter('RUNNING')}
+                  style={runningTasksCount > 0 ? { color: '#fbbf24', fontWeight: 600 } : {}}
+                >
+                  Running ({runningTasksCount})
+                </button>
+                <button
+                  type="button"
+                  className={`tasks-filter-tab ${tasksFilter === 'COMMANDS' ? 'active' : ''}`}
+                  onClick={() => setTasksFilter('COMMANDS')}
+                >
+                  Commands ({allTasks.filter(t => t.type === 'command').length})
+                </button>
+                <button
+                  type="button"
+                  className={`tasks-filter-tab ${tasksFilter === 'FILES' ? 'active' : ''}`}
+                  onClick={() => setTasksFilter('FILES')}
+                >
+                  Files ({allTasks.filter(t => t.type === 'read' || t.type === 'edit' || t.type === 'list').length})
+                </button>
+                <button
+                  type="button"
+                  className={`tasks-filter-tab ${tasksFilter === 'ERRORS' ? 'active' : ''}`}
+                  onClick={() => setTasksFilter('ERRORS')}
+                  style={allTasks.some(t => t.status === 'ERROR') ? { color: '#f87171' } : {}}
+                >
+                  Errors ({allTasks.filter(t => t.status === 'ERROR' || Boolean(t.error)).length})
+                </button>
+              </div>
+
+              <input
+                type="text"
+                className="tasks-search-input"
+                placeholder="Filter commands or files..."
+                value={tasksSearch}
+                onChange={e => setTasksSearch(e.target.value)}
+              />
+            </div>
+
+            {/* Task Cards List */}
+            <div className="tasks-list-scroll">
+              {filteredTasks.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '40px 20px', color: '#64748b', fontSize: '13px' }}>
+                  No tasks or commands match the current filter.
+                </div>
+              ) : (
+                filteredTasks.map(task => {
+                  const isRunning = task.status === 'RUNNING';
+                  const isError = task.status === 'ERROR' || Boolean(task.error);
+                  const isDone = task.status === 'DONE';
+                  const isWaiting = task.status === 'WAITING';
+                  const isCancelled = task.status === 'CANCELLED';
+                  const isExpanded = expandedModalTasks[task.stepIndex] ?? (isRunning || isError);
+
+                  return (
+                    <div
+                      key={task.stepIndex}
+                      className={`task-card-item ${isRunning ? 'running' : isError ? 'failed' : ''}`}
+                    >
+                      <div className="task-card-header" onClick={() => toggleModalTask(task.stepIndex)}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                          <span style={{ fontFamily: 'monospace', fontSize: '11px', color: '#64748b' }}>
+                            #{task.stepIndex}
+                          </span>
+
+                          <span className={`task-badge-status ${task.status.toLowerCase()}`}>
+                            {isRunning && <Loader2 size={10} className="spin" />}
+                            {isDone && <Check size={10} />}
+                            {isError && <AlertCircle size={10} />}
+                            {isWaiting && <Clock size={10} />}
+                            {isCancelled && <Ban size={10} />}
+                            {task.status}
+                          </span>
+
+                          <span className="task-type-tag">[{task.type}]</span>
+
+                          <span
+                            style={{
+                              fontSize: '12.5px',
+                              color: '#f1f5f9',
+                              fontFamily: task.type === 'command' ? 'monospace' : 'inherit',
+                              whiteSpace: 'nowrap',
+                              overflow: 'hidden',
+                              textOverflow: 'ellipsis',
+                              maxWidth: '420px'
+                            }}
+                            title={task.label}
+                          >
+                            {task.label}
+                          </span>
+                        </div>
+
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+                          {isRunning && (
+                            <button
+                              type="button"
+                              className="btn-kill-task"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleKillTask(task.stepIndex);
+                              }}
+                              title="Cancel / Stop this running command"
+                            >
+                              <Square size={11} fill="#ef4444" /> Stop
+                            </button>
+                          )}
+
+                          {(task.output || task.diff || task.error) && (
+                            <span style={{ color: '#64748b', display: 'flex', alignItems: 'center' }}>
+                              {isExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {isExpanded && (task.output || task.diff || task.error) && (
+                        <div className="task-expanded-body">
+                          {task.error && (
+                            <div style={{ padding: '8px 10px', background: 'rgba(239, 68, 68, 0.15)', borderLeft: '3px solid #ef4444', color: '#fca5a5', fontSize: '12px', marginBottom: '8px', borderRadius: '0 4px 4px 0', whiteSpace: 'pre-wrap' }}>
+                              <div style={{ fontWeight: 600, color: '#ef4444', marginBottom: '2px' }}>Error:</div>
+                              {task.error}
+                            </div>
+                          )}
+
+                          {task.diff && (
+                            <div style={{ marginBottom: '8px' }}>
+                              <pre className="task-output-pre" style={{ color: '#a78bfa' }}>{task.diff}</pre>
+                            </div>
+                          )}
+
+                          {task.output && (
+                            <div>
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' }}>
+                                <span style={{ fontSize: '11px', color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                                  Output
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => copyTaskOutput(task.stepIndex, task.output)}
+                                  style={{ background: 'transparent', border: 'none', color: '#38bdf8', fontSize: '11px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+                                >
+                                  {copiedStepIndex === task.stepIndex ? (
+                                    <>
+                                      <Check size={11} color="#34d399" />
+                                      <span style={{ color: '#34d399' }}>Copied!</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Copy size={11} />
+                                      <span>Copy</span>
+                                    </>
+                                  )}
+                                </button>
+                              </div>
+                              <pre className="task-output-pre">{task.output}</pre>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )}
             </div>
           </div>
         </div>

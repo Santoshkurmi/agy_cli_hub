@@ -1149,7 +1149,128 @@ export class AntigravityBrowserClient {
     }
   }
 
-  // 11. Stop execution
+  // 11. Get all tasks / commands / steps in conversation for inspector
+  async getConversationTasks(cascadeId) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: this.encodeFrame({
+        cascade_id: cascadeId,
+        trajectory_verbosity: 2
+      })
+    });
+    this.checkResponse(res);
+
+    const tasks = [];
+    await this.parseStream(res.body, (json) => {
+      const steps = json.steps || [];
+      steps.forEach((step, idx) => {
+        const rawStatus = step.status || '';
+        let status = 'DONE';
+        if (step.error || rawStatus.includes('ERROR') || rawStatus.includes('FAIL')) status = 'ERROR';
+        else if (rawStatus.includes('RUNNING')) status = 'RUNNING';
+        else if (rawStatus.includes('CANCEL')) status = 'CANCELLED';
+        else if (step.isWaiting || rawStatus.includes('WAIT')) status = 'WAITING';
+
+        const stepIndex = step.metadata?.sourceTrajectoryStepInfo?.stepIndex ?? idx;
+        const actionSummary = step.metadata?.toolAction || step.metadata?.toolSummary;
+
+        if (step.runCommand) {
+          const cmd = step.runCommand.commandLine || step.runCommand.proposedCommandLine || actionSummary || 'Command';
+          tasks.push({
+            stepIndex,
+            type: 'command',
+            label: cmd,
+            output: step.runCommand.combinedOutput?.full || step.runCommand.output || '',
+            error: step.error?.shortError || step.error?.message || '',
+            status,
+            rawStatus
+          });
+        } else if (step.searchWeb) {
+          const query = step.searchWeb.query || actionSummary || 'Web Search';
+          tasks.push({
+            stepIndex,
+            type: 'search',
+            label: `Web Search: ${query}`,
+            output: step.searchWeb.summary || '',
+            error: step.error?.shortError || step.error?.message || '',
+            status,
+            rawStatus
+          });
+        } else if (step.viewFile) {
+          const rawUri = step.viewFile.absolutePathUri || step.viewFile.uri || '';
+          const filePath = rawUri.replace(/^file:\/\//, '') || 'File';
+          const fileName = filePath.split('/').filter(Boolean).pop() || filePath;
+          const startLine = step.viewFile.startLine ?? (step.viewFile.endLine ? 1 : undefined);
+          const endLine = step.viewFile.endLine;
+          const rangeStr = (startLine !== undefined && endLine !== undefined)
+            ? `L${startLine}-L${endLine}`
+            : (step.viewFile.numLines ? `${step.viewFile.numLines} lines` : '');
+          tasks.push({
+            stepIndex,
+            type: 'read',
+            label: `Read: ${fileName}${rangeStr ? ` (${rangeStr})` : ''}`,
+            output: `File: ${filePath}\nRange: ${rangeStr}\nSize: ${step.viewFile.numBytes || 0} bytes${step.viewFile.content ? `\n\n${step.viewFile.content}` : ''}`,
+            error: step.error?.shortError || step.error?.message || '',
+            status,
+            rawStatus
+          });
+        } else if (step.listDirectory) {
+          const rawUri = step.listDirectory.directoryPathUri || '';
+          const dirPath = rawUri.replace(/^file:\/\//, '') || 'Directory';
+          const dirName = dirPath.split('/').filter(Boolean).pop() || dirPath;
+          const items = step.listDirectory.results || [];
+          tasks.push({
+            stepIndex,
+            type: 'list',
+            label: actionSummary || `List: ${dirName} (${items.length} items)`,
+            output: `Directory: ${dirPath}\nItems: ${items.length}\n` + items.map(i => `${i.isDir ? '📁' : '📄'} ${i.name}`).join('\n'),
+            error: step.error?.shortError || step.error?.message || '',
+            status,
+            rawStatus
+          });
+        } else if (step.find) {
+          tasks.push({
+            stepIndex,
+            type: 'find',
+            label: actionSummary || `Find: "${step.find.pattern}" in ${step.find.searchDirectory}`,
+            output: `Directory: ${step.find.searchDirectory}\nPattern: ${step.find.pattern}\nMatches:\n${step.find.truncatedOutput || ''}`,
+            error: step.error?.shortError || step.error?.message || '',
+            status,
+            rawStatus
+          });
+        } else if (step.codeAction) {
+          const rawUri = step.codeAction.uri || step.codeAction.actionSpec?.command?.file?.absoluteUri || step.codeAction.actionResult?.edit?.absoluteUri || '';
+          const filePath = rawUri.replace(/^file:\/\//, '') || 'File';
+          const fileName = filePath.split('/').filter(Boolean).pop() || filePath;
+          tasks.push({
+            stepIndex,
+            type: 'edit',
+            label: actionSummary || `Edit: ${fileName}`,
+            output: step.codeAction.diff || step.codeAction.content || 'Code Edit',
+            diff: step.codeAction.diff,
+            error: step.error?.shortError || step.error?.message || '',
+            status,
+            rawStatus
+          });
+        } else if (step.metadata?.toolAction || step.generic) {
+          tasks.push({
+            stepIndex,
+            type: 'action',
+            label: actionSummary || step.generic?.toolAction || 'Tool Action',
+            output: JSON.stringify(step.generic?.args || step.metadata?.internalMetadata || {}, null, 2),
+            error: step.error?.shortError || step.error?.message || '',
+            status,
+            rawStatus
+          });
+        }
+      });
+    });
+    return tasks;
+  }
+
+  // 12. Stop execution
   async stop(cascadeId) {
     if (!this.csrfToken) await this.initCsrfToken();
     const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/CancelCascadeInvocation`, {
