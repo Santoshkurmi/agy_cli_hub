@@ -129,26 +129,53 @@ export class AntigravityBrowserClient {
     }
   }
 
-  // 4. Fetch Available Models & Quotas
-  async getAvailableModels() {
+  // 4. Fetch Available Models & Quotas (Filtered to official agentModelSorts)
+  async getAvailableModels(forceRefresh = false) {
     if (!this.csrfToken) await this.initCsrfToken();
     const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetAvailableModels`, {
       method: 'POST',
       headers: this.getHeaders(),
-      body: this.encodeFrame({ force_refresh: true })
+      body: this.encodeFrame({ force_refresh: Boolean(forceRefresh) })
     });
     this.checkResponse(res);
 
     const models = [];
     await this.parseStream(res.body, (json) => {
       const raw = json.response?.models || {};
-      for (const [key, details] of Object.entries(raw)) {
-        if (!details.disabled) {
+      const sorts = json.response?.agentModelSorts || [];
+      const sortedIds = [];
+      for (const sort of sorts) {
+        for (const group of (sort.groups || [])) {
+          for (const id of (group.modelIds || [])) {
+            if (!sortedIds.includes(id)) sortedIds.push(id);
+          }
+        }
+      }
+
+      const keysToProcess = sortedIds.length > 0 
+        ? sortedIds 
+        : Object.keys(raw).filter(k => raw[k]?.displayName && !raw[k]?.isInternal);
+
+      for (const key of keysToProcess) {
+        const details = raw[key];
+        if (details && !details.disabled) {
+          let baseName = details.displayName || key;
+          let tier = null;
+          const tierMatch = baseName.match(/^(.*?)\s*\((High|Medium|Low)\)$/i);
+          if (tierMatch) {
+            baseName = tierMatch[1].trim();
+            tier = tierMatch[2].charAt(0).toUpperCase() + tierMatch[2].slice(1).toLowerCase();
+          }
+
           models.push({
             key,
             displayName: details.displayName || key,
+            baseName,
+            tier,
             modelEnum: details.model,
             supportsThinking: details.supportsThinking || false,
+            modelProvider: details.modelProvider,
+            apiProvider: details.apiProvider,
             quotaFraction: details.quotaInfo?.remainingFraction ?? 1,
             resetTime: details.quotaInfo?.resetTime || null
           });
@@ -156,6 +183,22 @@ export class AntigravityBrowserClient {
       }
     });
     return models;
+  }
+
+  // 4b. Fetch User Quota Summary (5-hour and 7-day rolling quotas for Gemini & Claude/GPT)
+  async getUserQuotaSummary() {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-codeium-csrf-token': this.csrfToken
+      },
+      body: JSON.stringify({})
+    });
+    this.checkResponse(res);
+    const data = await res.json();
+    return data.response || null;
   }
 
   // 5. Live Subscription to Conversation Summaries via JetboxSubscribeToSummaries

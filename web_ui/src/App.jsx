@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   MessageSquare,
   Plus,
@@ -37,6 +37,34 @@ import { AntigravityBrowserClient } from './agyClient';
 
 const client = new AntigravityBrowserClient('http://127.0.0.1:8090');
 
+function formatQuotaResetTime(isoString) {
+  if (!isoString) return 'N/A';
+  try {
+    const target = new Date(isoString).getTime();
+    const now = Date.now();
+    const diffMs = target - now;
+    if (diffMs <= 0) return 'Resetting now';
+
+    const totalMins = Math.floor(diffMs / (1000 * 60));
+    const days = Math.floor(totalMins / (60 * 24));
+    const hours = Math.floor((totalMins % (60 * 24)) / 60);
+    const mins = totalMins % 60;
+
+    const parts = [];
+    if (days > 0) parts.push(`${days}d`);
+    if (hours > 0 || days > 0) parts.push(`${hours}h`);
+    parts.push(`${mins}m`);
+
+    const dateObj = new Date(isoString);
+    const timeFormatted = dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const dayFormatted = days > 0 ? dateObj.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ', ' : '';
+
+    return `in ${parts.join(' ')} (${dayFormatted}${timeFormatted})`;
+  } catch (e) {
+    return isoString;
+  }
+}
+
 const getSavedWorkspaces = () => {
   try {
     return JSON.parse(localStorage.getItem('agy_session_workspaces') || '{}');
@@ -61,7 +89,9 @@ export default function App() {
   const [conversations, setConversations] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [models, setModels] = useState([]);
-  const [selectedModel, setSelectedModel] = useState('');
+  const [selectedModel, setSelectedModel] = useState(() => {
+    return localStorage.getItem('agy_preferred_model_enum') || '';
+  });
   const [thinkingBudget, setThinkingBudget] = useState(8192);
   const [autoExecutionPolicy, setAutoExecutionPolicy] = useState(() => {
     return localStorage.getItem('agy_auto_exec_policy') || 'EAGER';
@@ -80,6 +110,11 @@ export default function App() {
   const [tasksSearch, setTasksSearch] = useState('');
   const [expandedModalTasks, setExpandedModalTasks] = useState({});
   const [copiedStepIndex, setCopiedStepIndex] = useState(null);
+
+  // Quota & Rate Limit States
+  const [quotaSummary, setQuotaSummary] = useState(null);
+  const [showQuotaModal, setShowQuotaModal] = useState(false);
+  const [isRefreshingQuota, setIsRefreshingQuota] = useState(false);
 
   const [messages, setMessages] = useState([]);
   const [inputPrompt, setInputPrompt] = useState('');
@@ -216,6 +251,41 @@ export default function App() {
 
   const hasInitializedRef = useRef(false);
 
+  const fetchQuotaSummary = useCallback(async () => {
+    try {
+      setIsRefreshingQuota(true);
+      const summary = await client.getUserQuotaSummary();
+      if (summary) {
+        setQuotaSummary(summary);
+      }
+    } catch (err) {
+      console.warn('[UI] Failed to fetch quota summary:', err);
+    } finally {
+      setIsRefreshingQuota(false);
+    }
+  }, []);
+
+  // Poll quota every 2 minutes
+  useEffect(() => {
+    const timer = setInterval(() => {
+      fetchQuotaSummary();
+    }, 120000);
+    return () => clearInterval(timer);
+  }, [fetchQuotaSummary]);
+
+  // Close modals on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        setShowQuotaModal(false);
+        setShowTasksModal(false);
+        setShowProjectModal(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   // Initial connect & load (runs once on mount, guarded against duplicate executions)
   useEffect(() => {
     if (hasInitializedRef.current) return;
@@ -230,14 +300,24 @@ export default function App() {
       await client.initCsrfToken();
       setConnected(true);
 
-      // 1. Fetch available models
+      // 1. Fetch available models & initial quota
       console.log('[UI] Fetching available models...');
       const availableModels = await client.getAvailableModels();
       setModels(availableModels);
-      if (availableModels.length > 0 && !selectedModel) {
-        const preferred = availableModels.find(m => m.key.includes('3.8')) || availableModels[0];
-        setSelectedModel(preferred.modelEnum);
+      if (availableModels.length > 0) {
+        const savedKey = localStorage.getItem('agy_preferred_model_key');
+        const savedEnum = localStorage.getItem('agy_preferred_model_enum');
+        const matched = availableModels.find(m => 
+          (savedKey && m.key === savedKey) || (savedEnum && m.modelEnum === savedEnum)
+        );
+        if (matched) {
+          setSelectedModel(matched.modelEnum);
+        } else if (!selectedModel) {
+          const preferred = availableModels.find(m => m.key.includes('3.8')) || availableModels[0];
+          setSelectedModel(preferred.modelEnum);
+        }
       }
+      fetchQuotaSummary();
 
       // 2. Fetch projects
       console.log('[UI] Fetching registered projects...');
@@ -782,7 +862,69 @@ export default function App() {
     setTimeout(() => setCopiedStepIndex(null), 2000);
   };
 
-  const activeModelObj = models.find(m => m.modelEnum === selectedModel);
+  // Group available models into distinct families (Gemini 3.8 Flash, Gemini 3.1 Pro, Claude, GPT, etc.)
+  const modelFamilies = useMemo(() => {
+    const map = new Map();
+    for (const m of models) {
+      const famKey = m.baseName || m.displayName;
+      if (!map.has(famKey)) {
+        map.set(famKey, {
+          familyKey: famKey,
+          displayName: famKey,
+          variants: []
+        });
+      }
+      map.get(famKey).variants.push(m);
+    }
+
+    const tierOrder = { 'Low': 1, 'Medium': 2, 'High': 3 };
+    const list = [];
+    for (const fam of map.values()) {
+      fam.variants.sort((a, b) => (tierOrder[a.tier] || 0) - (tierOrder[b.tier] || 0));
+      list.push(fam);
+    }
+    return list;
+  }, [models]);
+
+  const activeModelObj = models.find(m => m.modelEnum === selectedModel) || models[0];
+  const activeFamily = modelFamilies.find(f => f.variants.some(v => v.modelEnum === activeModelObj?.modelEnum)) || modelFamilies[0];
+
+  const handleSelectModel = (modelEnum) => {
+    setSelectedModel(modelEnum);
+    if (modelEnum) {
+      localStorage.setItem('agy_preferred_model_enum', modelEnum);
+      const found = models.find(m => m.modelEnum === modelEnum);
+      if (found?.key) {
+        localStorage.setItem('agy_preferred_model_key', found.key);
+      }
+    }
+  };
+
+  const handleFamilyChange = (e) => {
+    const famKey = e.target.value;
+    const fam = modelFamilies.find(f => f.familyKey === famKey);
+    if (!fam || fam.variants.length === 0) return;
+    const prevTier = activeModelObj?.tier;
+    const matched = prevTier ? fam.variants.find(v => v.tier === prevTier) : null;
+    const target = matched || fam.variants[fam.variants.length - 1];
+    handleSelectModel(target.modelEnum);
+  };
+
+  const isGeminiModel = !activeModelObj || 
+    activeModelObj.key?.startsWith('gemini') || 
+    activeModelObj.modelProvider === 'MODEL_PROVIDER_GOOGLE';
+
+  const activeQuotaGroup = quotaSummary?.groups?.find(g => 
+    isGeminiModel 
+      ? g.displayName?.toLowerCase().includes('gemini') 
+      : (g.displayName?.toLowerCase().includes('claude') || g.displayName?.toLowerCase().includes('gpt'))
+  );
+
+  const bucket5h = activeQuotaGroup?.buckets?.find(b => b.window === '5h');
+  const bucketWeekly = activeQuotaGroup?.buckets?.find(b => b.window === 'weekly');
+
+  const pct5h = bucket5h?.remainingFraction !== undefined ? Math.round(bucket5h.remainingFraction * 100) : null;
+  const pctWeekly = bucketWeekly?.remainingFraction !== undefined ? Math.round(bucketWeekly.remainingFraction * 100) : null;
 
   return (
     <div className="app-container">
@@ -955,28 +1097,61 @@ export default function App() {
               </button>
             )}
 
-            {activeModelObj?.quotaFraction !== undefined && (
-              <div className="status-badge" style={{ color: '#38bdf8' }}>
-                Quota: {Math.round(activeModelObj.quotaFraction * 100)}%
-              </div>
-            )}
+            {/* Clickable Quota Badge (5h / 7d dual indicators) */}
+            <button
+              type="button"
+              className="quota-status-badge"
+              onClick={() => setShowQuotaModal(true)}
+              title="Click to view full 5-hour and 7-day quota breakdown"
+            >
+              <Zap size={13} color={pct5h !== null && pct5h <= 10 ? '#f87171' : '#38bdf8'} />
+              <span>
+                Quota ({isGeminiModel ? 'Gemini' : 'Claude/GPT'}):{' '}
+                <strong style={{ color: pct5h !== null && pct5h <= 15 ? '#f87171' : '#f1f5f9' }}>
+                  {pct5h !== null ? `${pct5h}%` : `${Math.round((activeModelObj?.quotaFraction ?? 1) * 100)}%`}
+                </strong>
+                {' / '}
+                <strong style={{ color: pctWeekly !== null && pctWeekly <= 15 ? '#f87171' : '#f1f5f9' }}>
+                  {pctWeekly !== null ? `${pctWeekly}%` : '100%'}
+                </strong>
+              </span>
+              <span className="quota-tag-label">(5h / 7d)</span>
+            </button>
           </div>
 
           <div className="top-bar-controls">
-            {/* Model Selector */}
-            <div className="control-group">
+            {/* Model Family Selector & Tier Pills */}
+            <div className="control-group model-selector-group">
               <Cpu size={14} />
               <select
                 className="select-control"
-                value={selectedModel}
-                onChange={(e) => setSelectedModel(e.target.value)}
+                value={activeFamily?.familyKey || ''}
+                onChange={handleFamilyChange}
+                title="Select Model Family"
               >
-                {models.map(m => (
-                  <option key={m.key} value={m.modelEnum}>
-                    {m.displayName}
+                {modelFamilies.map(f => (
+                  <option key={f.familyKey} value={f.familyKey}>
+                    {f.displayName}
                   </option>
                 ))}
               </select>
+
+              {/* Variant / Tier Pills (Low, Medium, High) if family has multiple variants */}
+              {activeFamily && activeFamily.variants.length > 1 && (
+                <div className="model-tiers-pills">
+                  {activeFamily.variants.map(v => (
+                    <button
+                      key={v.modelEnum}
+                      type="button"
+                      className={`tier-pill-btn ${selectedModel === v.modelEnum ? 'active' : ''}`}
+                      onClick={() => handleSelectModel(v.modelEnum)}
+                      title={`${v.displayName} - ${v.tier || 'Default'}`}
+                    >
+                      {v.tier || 'Std'}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Thinking Budget Slider */}
@@ -1703,6 +1878,129 @@ export default function App() {
                   );
                 })
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Quota Details Modal */}
+      {showQuotaModal && (
+        <div className="modal-overlay" onClick={() => setShowQuotaModal(false)}>
+          <div className="modal-card quota-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Zap size={18} color="#38bdf8" />
+                <div>
+                  <h3 className="modal-title" style={{ margin: 0 }}>Model Quotas & Limits</h3>
+                  <div style={{ fontSize: '11.5px', color: '#94a3b8' }}>Real-time 5-hour and 7-day subscription usage</div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <button
+                  type="button"
+                  onClick={fetchQuotaSummary}
+                  className="btn-icon"
+                  style={{ background: 'transparent', border: 'none', color: '#94a3b8', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+                  title="Refresh Quota"
+                  disabled={isRefreshingQuota}
+                >
+                  <RefreshCw size={14} className={isRefreshingQuota ? 'spin' : ''} />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowQuotaModal(false)}
+                  className="btn-icon"
+                  style={{ background: 'transparent', border: 'none', color: '#94a3b8', cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+                >
+                  <X size={18} />
+                </button>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '4px' }}>
+              {(quotaSummary?.groups || []).map((group, idx) => {
+                const b5h = group.buckets?.find(b => b.window === '5h');
+                const bWeekly = group.buckets?.find(b => b.window === 'weekly');
+                const p5h = b5h?.remainingFraction !== undefined ? Math.round(b5h.remainingFraction * 100) : 100;
+                const pWeekly = bWeekly?.remainingFraction !== undefined ? Math.round(bWeekly.remainingFraction * 100) : 100;
+
+                const getBarColor = (pct) => {
+                  if (pct > 40) return '#38bdf8';
+                  if (pct > 15) return '#f59e0b';
+                  return '#ef4444';
+                };
+
+                return (
+                  <div key={idx} className="quota-group-card">
+                    <div className="quota-group-header">
+                      <div className="quota-group-title">
+                        <span>{group.displayName}</span>
+                        <span className="quota-pool-badge">Shared Pool</span>
+                      </div>
+                    </div>
+
+                    <div className="quota-group-desc">
+                      {group.description}
+                    </div>
+
+                    <div className="quota-gauges-grid">
+                      {/* 5-Hour Limit Box */}
+                      <div className="quota-gauge-box">
+                        <div className="quota-gauge-top">
+                          <span className="quota-gauge-window">5-Hour Limit</span>
+                          <span className="quota-gauge-pct" style={{ color: getBarColor(p5h) }}>
+                            {p5h}% Remaining
+                          </span>
+                        </div>
+                        <div className="quota-bar-track">
+                          <div
+                            className="quota-bar-fill"
+                            style={{ width: `${p5h}%`, background: getBarColor(p5h) }}
+                          />
+                        </div>
+                        <div className="quota-reset-info">
+                          <Clock size={12} color="#94a3b8" />
+                          <span>Resets {formatQuotaResetTime(b5h?.resetTime)}</span>
+                        </div>
+                        {b5h?.description && (
+                          <div className="quota-bucket-desc">
+                            {b5h.description}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* 7-Day Weekly Limit Box */}
+                      <div className="quota-gauge-box">
+                        <div className="quota-gauge-top">
+                          <span className="quota-gauge-window">7-Day (Weekly) Limit</span>
+                          <span className="quota-gauge-pct" style={{ color: getBarColor(pWeekly) }}>
+                            {pWeekly}% Remaining
+                          </span>
+                        </div>
+                        <div className="quota-bar-track">
+                          <div
+                            className="quota-bar-fill"
+                            style={{ width: `${pWeekly}%`, background: getBarColor(pWeekly) }}
+                          />
+                        </div>
+                        <div className="quota-reset-info">
+                          <Clock size={12} color="#94a3b8" />
+                          <span>Resets {formatQuotaResetTime(bWeekly?.resetTime)}</span>
+                        </div>
+                        {bWeekly?.description && (
+                          <div className="quota-bucket-desc">
+                            {bWeekly.description}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+
+              <div className="quota-modal-footer-note">
+                💡 <strong>How Quotas Work:</strong> Within each pool, models share both a 5-hour smoothing limit and a 7-day weekly limit. Token consumption is weighted by model capability. When the 5-hour limit is reached for Claude/GPT, you can continue working seamlessly using Gemini models.
+              </div>
             </div>
           </div>
         </div>
