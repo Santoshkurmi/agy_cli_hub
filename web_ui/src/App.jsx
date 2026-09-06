@@ -106,6 +106,7 @@ export default function App() {
   const totalStepsRef = useRef(0);           // tracked from StreamAgentStateUpdates
   const isGeneratingRef = useRef(false);
   const activeSessionIdRef = useRef(activeSessionId);
+  const hasInitialSelectedRef = useRef(false);
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
@@ -286,7 +287,8 @@ export default function App() {
 
           const sorted = Array.from(map.values()).sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
 
-          if (!activeSessionIdRef.current && sorted.length > 0) {
+          if (!hasInitialSelectedRef.current && !activeSessionIdRef.current && sorted.length > 0) {
+            hasInitialSelectedRef.current = true;
             selectConversation(sorted[0].id);
           }
 
@@ -307,40 +309,36 @@ export default function App() {
     setShowProjectModal(true);
   };
 
-  const handleConfirmProject = async (path, projId) => {
+  const handleConfirmProject = (path, projId) => {
     const finalPath = (path || '').trim() || '/home/cat/agy_cli_hub';
     const finalProjId = projId || 'default-cli-project';
     setWorkspaceDir(finalPath);
     setSelectedProjectId(finalProjId);
     setShowProjectModal(false);
 
+    // Prevent auto-selection in JetboxSubscribeToSummaries from kicking us out of the new chat
+    hasInitialSelectedRef.current = true;
+
+    // Abort any existing stream from previous conversation
+    if (streamControllerRef.current) {
+      streamControllerRef.current.abort();
+      streamControllerRef.current = null;
+    }
+
+    setActiveSessionId(null);
+    turnStartStepRef.current = 0;
+    totalStepsRef.current = 0;
+    setIsGenerating(false);
+    isGeneratingRef.current = false;
+    setIsLoadingChat(false);
+
     const projObj = projects.find(p => p.id === finalProjId);
     const projName = projObj?.name || finalPath.split('/').filter(Boolean).pop() || 'Workspace';
 
-    try {
-      const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
-      const cascadeId = await client.startConversation(modelToUse, finalPath, finalProjId);
-      saveSessionWorkspace(cascadeId, finalPath, finalProjId);
-      const newChat = {
-        id: cascadeId,
-        title: `Session (${projName})`,
-        lastModified: new Date().toISOString(),
-        stepCount: 0,
-        workspaceDir: finalPath,
-        projectId: finalProjId
-      };
-      setConversations(prev => [newChat, ...prev]);
-      setActiveSessionId(cascadeId);
-      setMessages([
-        { role: 'system', content: `Workspace initialized: ${finalPath} [${projName}]` }
-      ]);
-      showToast(`Session created in ${projName}`, 'success');
-      // Open ONE persistent stream for the newly created conversation
-      startPersistentStream(cascadeId);
-    } catch (err) {
-      console.error('Failed to start session:', err);
-      showToast(`Failed to start session: ${err.message}`, 'error');
-    }
+    setMessages([
+      { role: 'system', content: `Workspace ready: ${finalPath} [${projName}]. Type a message to begin.` }
+    ]);
+    showToast(`Ready in ${projName}. Type a message to start.`, 'info');
   };
 
   // ---- Persistent stream management ----
@@ -582,7 +580,6 @@ export default function App() {
     if (!targetSessionId) {
       try {
         targetSessionId = await client.startConversation(modelToUse, workspaceDir, selectedProjectId);
-        newSessionsNeedingTitleRef.current.add(targetSessionId);
         setActiveSessionId(targetSessionId);
         saveSessionWorkspace(targetSessionId, workspaceDir, selectedProjectId);
         const projObj = projects.find(p => p.id === selectedProjectId);
@@ -599,7 +596,7 @@ export default function App() {
         startPersistentStream(targetSessionId);
       } catch (startErr) {
         console.error('Failed to create session:', startErr);
-        alert(`Failed to create session: ${startErr.message}`);
+        showToast(`Failed to create session: ${startErr.message}`, 'error');
         return;
       }
     }
@@ -612,7 +609,11 @@ export default function App() {
     turnStartStepRef.current = totalStepsRef.current;
 
     // 2. Append user message & placeholder assistant turn
-    setMessages(prev => [...prev, { role: 'user', content: currentPrompt }, { role: 'assistant', steps: [] }]);
+    setMessages(prev => [
+      ...prev.filter(m => m.role !== 'system'),
+      { role: 'user', content: currentPrompt },
+      { role: 'assistant', steps: [] }
+    ]);
     isGeneratingRef.current = true;
     setIsGenerating(true);
 
