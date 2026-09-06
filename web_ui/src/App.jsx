@@ -94,7 +94,9 @@ export default function App() {
   };
 
   const messagesEndRef = useRef(null);
-  const abortControllerRef = useRef(null);
+  const abortControllerRef = useRef(null);  // for stop button (CancelCascadeInvocation)
+  const streamControllerRef = useRef(null); // for the one persistent stream per session
+  const turnStartStepRef = useRef(0);        // updated before each sendMessage
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -191,18 +193,167 @@ export default function App() {
         { role: 'system', content: `Workspace initialized: ${finalPath} [${projName}]` }
       ]);
       showToast(`Session created in ${projName}`, 'success');
+      // Open ONE persistent stream for the newly created conversation
+      startPersistentStream(cascadeId);
     } catch (err) {
       console.error('Failed to start session:', err);
       showToast(`Failed to start session: ${err.message}`, 'error');
     }
   };
 
-  const selectConversation = async (id) => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
+  // ---- Persistent stream management ----
+  // Starts ONE long-lived StreamAgentStateUpdates connection for a session.
+  // Stays open across all turns; turnStartStepRef controls which steps are
+  // routed to the current assistant bubble.
+  const startPersistentStream = (sessionId) => {
+    // Abort any existing stream for this session
+    if (streamControllerRef.current) {
+      streamControllerRef.current.abort();
+      streamControllerRef.current = null;
     }
+    if (!sessionId) return;
+
+    const controller = new AbortController();
+    streamControllerRef.current = controller;
+
+    // Only refresh the conversation list once per session (after the first response,
+    // when the daemon sets the chat title). Subsequent turns don't change the list.
+    let doneCount = 0;
+
+    // Pass a getter so the stream reads the current turn boundary dynamically
+    client.streamUpdates(
+      sessionId,
+      (update) => {
+        if (update.type === 'done') {
+          setIsGenerating(false);
+          doneCount++;
+          // Only fetch conversation list on the FIRST done (title gets assigned then).
+          // After that, the list won't change until a new session is created.
+          if (doneCount === 1) {
+            client.listConversations().then(remoteList => {
+              const saved = getSavedWorkspaces();
+              setConversations(prev => remoteList.map(remote => {
+                const existing = prev.find(p => p.id === remote.id);
+                return {
+                  ...remote,
+                  workspaceDir: existing?.workspaceDir || saved[remote.id]?.workspaceDir || '/home/cat/agy_cli_hub',
+                  projectId: existing?.projectId || saved[remote.id]?.projectId || 'default-cli-project'
+                };
+              }));
+            });
+          }
+          return;
+        }
+
+        setMessages(prev => {
+          const clone = [...prev];
+          const lastIdx = clone.length - 1;
+          if (lastIdx < 0 || clone[lastIdx].role !== 'assistant') return clone;
+
+          const last = { ...clone[lastIdx], steps: [...(clone[lastIdx].steps || [])] };
+          clone[lastIdx] = last;
+
+          let stepObj = last.steps.find(s => s.stepIndex === update.stepIndex);
+
+          if (update.type === 'thinking') {
+            const thinkingText = update.full !== undefined ? update.full : ((stepObj?.thinking || '') + (update.delta || ''));
+            let thinkStep = last.steps.find(s => s.type === 'planner' && (s.stepIndex === update.stepIndex || (s.thinking && !s.content)));
+            if (!thinkStep) {
+              thinkStep = { stepIndex: update.stepIndex, type: 'planner', thinking: thinkingText, content: '' };
+              last.steps.push(thinkStep);
+            } else {
+              const sIdx = last.steps.indexOf(thinkStep);
+              last.steps[sIdx] = { ...thinkStep, stepIndex: update.stepIndex, thinking: thinkingText };
+            }
+          } else if (update.type === 'content') {
+            const contentText = update.full !== undefined ? update.full : ((stepObj?.content || '') + (update.delta || ''));
+            let contentStep = last.steps.find(s => s.type === 'planner' && (s.stepIndex === update.stepIndex || Boolean(s.content)));
+            if (!contentStep) {
+              contentStep = { stepIndex: update.stepIndex, type: 'planner', thinking: '', content: contentText };
+              last.steps.push(contentStep);
+            } else {
+              const sIdx = last.steps.indexOf(contentStep);
+              last.steps[sIdx] = { ...contentStep, stepIndex: update.stepIndex, content: contentText };
+            }
+          } else if (update.type === 'tool') {
+            const prevRetryIdx = (update.toolType === 'command' && update.command)
+              ? last.steps.findIndex(s => s.toolType === 'command' && s.command === update.command && (!s.output || s.isWaiting || s.isProposed))
+              : -1;
+            if (prevRetryIdx !== -1) {
+              last.steps[prevRetryIdx] = { ...last.steps[prevRetryIdx], ...update };
+            } else if (!stepObj) {
+              stepObj = { stepIndex: update.stepIndex, ...update };
+              last.steps.push(stepObj);
+            } else {
+              const sIdx = last.steps.indexOf(stepObj);
+              last.steps[sIdx] = { ...stepObj, ...update };
+            }
+          } else if (update.type === 'tool_output') {
+            const targetStep = stepObj || (update.command ? last.steps.find(s => s.toolType === 'command' && s.command === update.command) : null) || last.steps.slice().reverse().find(s => s.toolType === 'command');
+            if (targetStep) {
+              const sIdx = last.steps.indexOf(targetStep);
+              last.steps[sIdx] = {
+                ...targetStep,
+                output: update.output,
+                isProposed: update.isProposed,
+                status: update.status,
+                isWaiting: update.isWaiting,
+                error: update.error
+              };
+            }
+          } else if (update.type === 'notify_user') {
+            if (!stepObj) {
+              stepObj = {
+                stepIndex: update.stepIndex,
+                type: 'notifyUser',
+                content: update.content,
+                reviewUris: update.reviewUris,
+                isBlocking: update.isBlocking,
+                askForUserFeedback: update.askForUserFeedback,
+                confidence: update.confidence
+              };
+              last.steps.push(stepObj);
+            } else {
+              const sIdx = last.steps.indexOf(stepObj);
+              last.steps[sIdx] = {
+                ...stepObj,
+                type: 'notifyUser',
+                content: update.content,
+                reviewUris: update.reviewUris,
+                isBlocking: update.isBlocking
+              };
+            }
+          } else if (update.type === 'error') {
+            const errIdx = last.steps.findIndex(s => s.type === 'exec_error');
+            const newErrStep = {
+              stepIndex: errIdx >= 0 ? last.steps[errIdx].stepIndex : Date.now(),
+              type: 'exec_error',
+              content: update.message || 'An unknown execution error occurred.'
+            };
+            if (errIdx >= 0) {
+              last.steps[errIdx] = newErrStep;
+            } else {
+              last.steps.push(newErrStep);
+            }
+          }
+
+          return clone;
+        });
+      },
+      controller.signal,
+      () => turnStartStepRef.current, // dynamic getter — updated before each sendMessage
+      true // persistent: don't stop stream on IDLE
+    ).catch(err => {
+      if (err.name !== 'AbortError') {
+        console.error('[Stream] Persistent stream error:', err);
+      }
+    });
+  };
+
+  const selectConversation = async (id) => {
     setActiveSessionId(id);
     setIsGenerating(false);
+    turnStartStepRef.current = 0;
 
     const targetConv = conversations.find(c => c.id === id);
     const saved = getSavedWorkspaces();
@@ -218,6 +369,9 @@ export default function App() {
       console.error('Failed to load history:', err);
       showToast(`Failed to load history: ${err.message}`, 'error');
     }
+
+    // Open ONE persistent stream for this conversation
+    startPersistentStream(id);
   };
 
   const handleApproveCommand = async (stepIndex, scope = 'PERMISSION_SCOPE_ONCE') => {
@@ -294,6 +448,8 @@ export default function App() {
           workspaceDir,
           projectId: selectedProjectId
         }, ...prev]);
+        // Open the persistent stream for this new session
+        startPersistentStream(targetSessionId);
       } catch (startErr) {
         console.error('Failed to create session:', startErr);
         alert(`Failed to create session: ${startErr.message}`);
@@ -304,20 +460,21 @@ export default function App() {
     const currentPrompt = inputPrompt;
     setInputPrompt('');
 
-    // 1. Get current step count so streamUpdates ignores prior turns
+    // 1. Snapshot current step count as the turn boundary for this message.
+    //    The persistent stream reads turnStartStepRef dynamically, so setting
+    //    this BEFORE sendMessage ensures the stream only routes new steps here.
     let startStepIndex = 0;
     try {
       startStepIndex = await client.getRawStepCount(targetSessionId);
     } catch { }
+    turnStartStepRef.current = startStepIndex;
 
     // 2. Append user message & placeholder assistant turn
-    const userMsg = { role: 'user', content: currentPrompt };
-    const assistantMsg = { role: 'assistant', steps: [] };
-    setMessages(prev => [...prev, userMsg, assistantMsg]);
+    setMessages(prev => [...prev, { role: 'user', content: currentPrompt }, { role: 'assistant', steps: [] }]);
     setIsGenerating(true);
 
     try {
-      // 3. Send User Cascade Message directly with execution policy
+      // 3. Send the message — the persistent stream already open will receive updates
       await client.sendMessage({
         cascadeId: targetSessionId,
         text: currentPrompt,
@@ -325,134 +482,22 @@ export default function App() {
         thinkingBudget: parseInt(thinkingBudget, 10),
         autoExecutionPolicy
       });
-
-      // 4. Stream Agent Updates starting strictly after startStepIndex
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
-
-      await client.streamUpdates(targetSessionId, (update) => {
-        if (update.type === 'done') {
-          setIsGenerating(false);
-          client.listConversations().then(remoteList => {
-            const saved = getSavedWorkspaces();
-            setConversations(prev => remoteList.map(remote => {
-              const existing = prev.find(p => p.id === remote.id);
-              return {
-                ...remote,
-                workspaceDir: existing?.workspaceDir || saved[remote.id]?.workspaceDir || '/home/cat/agy_cli_hub',
-                projectId: existing?.projectId || saved[remote.id]?.projectId || 'default-cli-project'
-              };
-            }));
-          });
-          return;
-        }
-
-        setMessages(prev => {
-          const clone = [...prev];
-          const lastIdx = clone.length - 1;
-          if (lastIdx < 0 || clone[lastIdx].role !== 'assistant') return clone;
-
-          const last = { ...clone[lastIdx], steps: [...(clone[lastIdx].steps || [])] };
-          clone[lastIdx] = last;
-
-          let stepObj = last.steps.find(s => s.stepIndex === update.stepIndex);
-
-          if (update.type === 'thinking') {
-            const thinkingText = update.full !== undefined ? update.full : ((stepObj?.thinking || '') + (update.delta || ''));
-            let thinkStep = last.steps.find(s => s.type === 'planner' && (s.stepIndex === update.stepIndex || (s.thinking && !s.content)));
-            if (!thinkStep) {
-              thinkStep = { stepIndex: update.stepIndex, type: 'planner', thinking: thinkingText, content: '' };
-              last.steps.push(thinkStep);
-            } else {
-              const sIdx = last.steps.indexOf(thinkStep);
-              last.steps[sIdx] = { ...thinkStep, stepIndex: update.stepIndex, thinking: thinkingText };
-            }
-          } else if (update.type === 'content') {
-            const contentText = update.full !== undefined ? update.full : ((stepObj?.content || '') + (update.delta || ''));
-            let contentStep = last.steps.find(s => s.type === 'planner' && (s.stepIndex === update.stepIndex || Boolean(s.content)));
-            if (!contentStep) {
-              contentStep = { stepIndex: update.stepIndex, type: 'planner', thinking: '', content: contentText };
-              last.steps.push(contentStep);
-            } else {
-              const sIdx = last.steps.indexOf(contentStep);
-              last.steps[sIdx] = { ...contentStep, stepIndex: update.stepIndex, content: contentText };
-            }
-          } else if (update.type === 'tool') {
-            // Replace previous empty or waiting instance of same command if any
-            const prevRetryIdx = (update.toolType === 'command' && update.command)
-              ? last.steps.findIndex(s => s.toolType === 'command' && s.command === update.command && (!s.output || s.isWaiting || s.isProposed))
-              : -1;
-            if (prevRetryIdx !== -1) {
-              last.steps[prevRetryIdx] = { ...last.steps[prevRetryIdx], ...update };
-            } else if (!stepObj) {
-              stepObj = { stepIndex: update.stepIndex, ...update };
-              last.steps.push(stepObj);
-            } else {
-              const sIdx = last.steps.indexOf(stepObj);
-              last.steps[sIdx] = { ...stepObj, ...update };
-            }
-          } else if (update.type === 'tool_output') {
-            const targetStep = stepObj || (update.command ? last.steps.find(s => s.toolType === 'command' && s.command === update.command) : null) || last.steps.slice().reverse().find(s => s.toolType === 'command');
-            if (targetStep) {
-              const sIdx = last.steps.indexOf(targetStep);
-              last.steps[sIdx] = {
-                ...targetStep,
-                output: update.output,
-                isProposed: update.isProposed,
-                status: update.status,
-                isWaiting: update.isWaiting,
-                error: update.error
-              };
-            }
-          } else if (update.type === 'notify_user') {
-            if (!stepObj) {
-              stepObj = {
-                stepIndex: update.stepIndex,
-                type: 'notifyUser',
-                content: update.content,
-                reviewUris: update.reviewUris,
-                isBlocking: update.isBlocking,
-                askForUserFeedback: update.askForUserFeedback,
-                confidence: update.confidence
-              };
-              last.steps.push(stepObj);
-            } else {
-              const sIdx = last.steps.indexOf(stepObj);
-              last.steps[sIdx] = {
-                ...stepObj,
-                type: 'notifyUser',
-                content: update.content,
-                reviewUris: update.reviewUris,
-                isBlocking: update.isBlocking
-              };
-            }
-          }
-          return clone;
-        });
-      }, controller.signal, startStepIndex);
-
     } catch (err) {
-      if (err.name !== 'AbortError') {
-        console.error('Chat execution error:', err);
-        setMessages(prev => {
-          const clone = [...prev];
-          const lastIdx = clone.length - 1;
-          if (lastIdx >= 0 && clone[lastIdx].role === 'assistant') {
-            clone[lastIdx] = {
-              ...clone[lastIdx],
-              steps: [
-                ...(clone[lastIdx].steps || []),
-                {
-                  stepIndex: 999999,
-                  type: 'error',
-                  content: `Failed to send message: ${err.message}`
-                }
-              ]
-            };
-          }
-          return clone;
-        });
-      }
+      console.error('Chat send error:', err);
+      setMessages(prev => {
+        const clone = [...prev];
+        const lastIdx = clone.length - 1;
+        if (lastIdx >= 0 && clone[lastIdx].role === 'assistant') {
+          clone[lastIdx] = {
+            ...clone[lastIdx],
+            steps: [
+              ...(clone[lastIdx].steps || []),
+              { stepIndex: 999999, type: 'error', content: `Failed to send message: ${err.message}` }
+            ]
+          };
+        }
+        return clone;
+      });
       setIsGenerating(false);
     }
   };
@@ -461,11 +506,13 @@ export default function App() {
     if (activeSessionId) {
       await client.stop(activeSessionId);
     }
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
+    // NOTE: Do NOT abort streamControllerRef — the persistent stream must stay alive.
+    // abortControllerRef is only for stop button legacy; generation stop is done via CancelCascadeInvocation.
     setIsGenerating(false);
   };
+
+
+
 
   const toggleThinking = (key) => {
     setCollapsedThinking(prev => ({
@@ -681,6 +728,38 @@ export default function App() {
                           </div>
                         );
                       }
+
+                      if (step.type === 'exec_error') {
+                        // Parse quota reset time if present
+                        const resetMatch = step.content.match(/Resets in ([^.]+)/);
+                        const quotaMatch = step.content.match(/RESOURCE_EXHAUSTED|quota reached/i);
+                        return (
+                          <div key={sIdx} style={{
+                            padding: '14px 16px',
+                            borderRadius: '10px',
+                            background: 'rgba(239, 68, 68, 0.08)',
+                            border: '1px solid rgba(239, 68, 68, 0.25)',
+                            margin: '8px 0',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '6px'
+                          }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#f87171', fontWeight: 600, fontSize: '13px' }}>
+                              <AlertCircle size={15} />
+                              <span>{quotaMatch ? '⚡ Quota Limit Reached' : '❌ Execution Error'}</span>
+                            </div>
+                            <div style={{ color: '#fca5a5', fontSize: '12px', lineHeight: '1.5', wordBreak: 'break-word' }}>
+                              {step.content}
+                            </div>
+                            {resetMatch && (
+                              <div style={{ color: '#94a3b8', fontSize: '11px', marginTop: '2px' }}>
+                                🕐 Quota resets in {resetMatch[1]}. Consider switching to a different model in the toolbar above.
+                              </div>
+                            )}
+                          </div>
+                        );
+                      }
+
 
                       if (step.type === 'planner') {
                         const thinkKey = `${idx}-${step.stepIndex}`;

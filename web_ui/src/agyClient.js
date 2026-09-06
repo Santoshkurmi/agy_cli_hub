@@ -629,9 +629,14 @@ export class AntigravityBrowserClient {
     return res;
   }
 
-  // 10. Stream Live Agent State Updates starting from startStepIndex
-  async streamUpdates(cascadeId, onUpdate, abortSignal, startStepIndex = 0) {
+  // 10. Persistent stream for a conversation — one connection for the entire session lifetime.
+  // startStepGetter is a function () => number so the current turn boundary can be updated
+  // between messages without reopening the stream.
+  // persistent=true means IDLE signals only fire onUpdate('done') but don't close the stream.
+  async streamUpdates(cascadeId, onUpdate, abortSignal, startStepIndex = 0, persistent = false) {
     if (!this.csrfToken) await this.initCsrfToken();
+    // Allow passing a getter fn so callers can dynamically update the turn boundary
+    const getStartStep = typeof startStepIndex === 'function' ? startStepIndex : () => startStepIndex;
     const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates`, {
       method: 'POST',
       headers: this.getHeaders(),
@@ -640,7 +645,7 @@ export class AntigravityBrowserClient {
         subscriberId: `web-sub-${Date.now()}`,
         trajectoryVerbosity: 2,
         initialStepsPageBounds: {
-          startIndex: startStepIndex
+          startIndex: 0  // Always start from 0 for persistent streams; filtering is done per-turn
         }
       }),
       signal: abortSignal
@@ -653,7 +658,7 @@ export class AntigravityBrowserClient {
     let isDone = false;
     const markDone = () => {
       if (!isDone) {
-        isDone = true;
+        if (!persistent) isDone = true;
         onUpdate({ type: 'done' });
       }
     };
@@ -663,21 +668,44 @@ export class AntigravityBrowserClient {
         const update = chunk.update;
         const status = update?.status || update?.executableStatus || update?.executorLoopStatus || '';
 
+        // Detect execution errors from executorMetadatasUpdate (most reliable source)
+        // The error is at: update.mainTrajectoryUpdate.executorMetadatasUpdate.executorMetadatas[].executionError
+        // CRITICAL: Only emit errors where lastStepIdx >= getStartStep() so errors from
+        // previous failed turns don't bleed into the current turn's chat bubble.
+        const executorMetas = update?.mainTrajectoryUpdate?.executorMetadatasUpdate?.executorMetadatas || [];
+        for (const meta of executorMetas) {
+          const metaLastStep = meta.lastStepIdx ?? -1;
+          const belongsToThisTurn = metaLastStep < 0 || metaLastStep >= getStartStep();
+          if (meta.executionError && belongsToThisTurn && !seenToolSteps.has(`exec-err-${meta.executionId}`)) {
+            seenToolSteps.add(`exec-err-${meta.executionId}`);
+            onUpdate({ type: 'error', message: meta.executionError });
+          }
+        }
+
         const steps = update?.mainTrajectoryUpdate?.stepsUpdate?.steps || [];
         const indices = update?.mainTrajectoryUpdate?.stepsUpdate?.indices || [];
+
 
         for (let i = 0; i < steps.length; i++) {
           const step = steps[i];
           const stepInfo = step.metadata?.sourceTrajectoryStepInfo;
           const stepIndex = (stepInfo?.stepIndex !== undefined)
             ? stepInfo.stepIndex
-            : (indices[i] !== undefined ? indices[i] : (startStepIndex + i));
+            : (indices[i] !== undefined ? indices[i] : (getStartStep() + i));
           const trajectoryId = stepInfo?.trajectoryId || cascadeId;
           
           // CRITICAL: Skip all steps belonging to previous turns
-          if (stepIndex < startStepIndex) continue;
+          if (stepIndex < getStartStep()) continue;
+
+          // Check for step-level execution errors
+          const stepExecError = step.executionError || step.error?.message;
+          if (stepExecError && !seenToolSteps.has(`err-${stepIndex}`)) {
+            seenToolSteps.add(`err-${stepIndex}`);
+            onUpdate({ type: 'error', message: stepExecError });
+          }
 
           // 1. Thinking
+
           if (step.plannerResponse?.thinking) {
             const full = step.plannerResponse.thinking;
             const prev = stepThinkingOffsets.get(stepIndex) || 0;
