@@ -695,12 +695,66 @@ export class AntigravityBrowserClient {
         if (isFirstChunk) {
           isFirstChunk = false;
           const initialTurns = this.parseStepsToTurns(steps);
+
+          // Find the stepIndex where the current (last) user prompt started
+          let lastUserStepIndex = 0;
+          for (let i = steps.length - 1; i >= 0; i--) {
+            const step = steps[i];
+            if (step.userInput) {
+              const stepInfo = step.metadata?.sourceTrajectoryStepInfo;
+              lastUserStepIndex = (stepInfo?.stepIndex !== undefined)
+                ? stepInfo.stepIndex
+                : (indices[i] !== undefined ? indices[i] : i);
+              break;
+            }
+          }
+
+          // Pre-seed offsets & seenToolSteps for steps in Chunk 0 so subsequent chunks seamlessly continue
+          for (let i = 0; i < steps.length; i++) {
+            const step = steps[i];
+            const stepInfo = step.metadata?.sourceTrajectoryStepInfo;
+            const stepIndex = (stepInfo?.stepIndex !== undefined)
+              ? stepInfo.stepIndex
+              : (indices[i] !== undefined ? indices[i] : i);
+
+            if (step.plannerResponse?.thinking) {
+              stepThinkingOffsets.set(stepIndex, step.plannerResponse.thinking.length);
+            }
+            if (step.plannerResponse?.response) {
+              stepResponseOffsets.set(stepIndex, step.plannerResponse.response.length);
+            }
+            if (step.runCommand || step.generic?.args?.CommandLine || step.requestedInteraction?.permission) {
+              seenToolSteps.add(`cmd-${stepIndex}`);
+            }
+            if (step.viewFile) {
+              seenToolSteps.add(`read-${stepIndex}`);
+            }
+            if (step.codeAction) {
+              seenToolSteps.add(`edit-${stepIndex}`);
+            }
+            if (step.notifyUser) {
+              seenToolSteps.add(`notify-${stepIndex}`);
+            }
+            if (step.searchWeb) {
+              seenToolSteps.add(`search-${stepIndex}`);
+            }
+          }
+
+          const lastStep = steps[steps.length - 1];
+          const isLastStepRunning = Boolean(lastStep && (
+            lastStep.status === 'CORTEX_STEP_STATUS_RUNNING' ||
+            lastStep.status === 'CORTEX_STEP_STATUS_WAITING' ||
+            Boolean(lastStep.requestedInteraction?.permission)
+          ));
+          const isRunning = status.includes('RUNNING') || status.includes('WAITING') || isLastStepRunning;
+
           onUpdate({
             type: 'init',
             messages: initialTurns,
             totalLength,
             status,
-            isRunning: status.includes('RUNNING')
+            isRunning,
+            currentTurnStartStep: lastUserStepIndex
           });
           return;
         }

@@ -362,7 +362,9 @@ export default function App() {
       (update) => {
         if (update.type === 'init') {
           totalStepsRef.current = update.totalLength || 0;
-          turnStartStepRef.current = update.totalLength || 0;
+          turnStartStepRef.current = update.currentTurnStartStep !== undefined
+            ? update.currentTurnStartStep
+            : (update.totalLength || 0);
           if (update.messages && update.messages.length > 0) {
             setMessages(update.messages);
           }
@@ -394,8 +396,11 @@ export default function App() {
 
         setMessages(prev => {
           const clone = [...prev];
-          const lastIdx = clone.length - 1;
-          if (lastIdx < 0 || clone[lastIdx].role !== 'assistant') return clone;
+          let lastIdx = clone.length - 1;
+          if (lastIdx < 0 || clone[lastIdx].role !== 'assistant') {
+            clone.push({ role: 'assistant', steps: [] });
+            lastIdx = clone.length - 1;
+          }
 
           const last = { ...clone[lastIdx], steps: [...(clone[lastIdx].steps || [])] };
           clone[lastIdx] = last;
