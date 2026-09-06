@@ -97,6 +97,7 @@ export default function App() {
   const abortControllerRef = useRef(null);  // for stop button (CancelCascadeInvocation)
   const streamControllerRef = useRef(null); // for the one persistent stream per session
   const turnStartStepRef = useRef(0);        // updated before each sendMessage
+  const totalStepsRef = useRef(0);           // tracked from StreamAgentStateUpdates
   const isGeneratingRef = useRef(false);
   const newSessionsNeedingTitleRef = useRef(new Set());
 
@@ -228,6 +229,31 @@ export default function App() {
     client.streamUpdates(
       sessionId,
       (update) => {
+        if (update.type === 'init') {
+          totalStepsRef.current = update.totalLength || 0;
+          turnStartStepRef.current = update.totalLength || 0;
+          if (update.messages && update.messages.length > 0) {
+            setMessages(update.messages);
+          }
+          if (update.isRunning) {
+            setIsGenerating(true);
+            isGeneratingRef.current = true;
+          } else {
+            setIsGenerating(false);
+            isGeneratingRef.current = false;
+          }
+          return;
+        }
+
+        if (update.type === 'step_count') {
+          totalStepsRef.current = update.totalLength;
+          return;
+        }
+
+        if (update.stepIndex !== undefined && update.stepIndex >= totalStepsRef.current) {
+          totalStepsRef.current = update.stepIndex + 1;
+        }
+
         if (update.type === 'done') {
           const wasGenerating = isGeneratingRef.current;
           isGeneratingRef.current = false;
@@ -364,6 +390,7 @@ export default function App() {
     isGeneratingRef.current = false;
     setIsGenerating(false);
     turnStartStepRef.current = 0;
+    totalStepsRef.current = 0;
 
     const targetConv = conversations.find(c => c.id === id);
     const saved = getSavedWorkspaces();
@@ -372,15 +399,7 @@ export default function App() {
     if (path) setWorkspaceDir(path);
     if (proj) setSelectedProjectId(proj);
 
-    try {
-      const steps = await client.getConversationHistory(id);
-      setMessages(steps);
-    } catch (err) {
-      console.error('Failed to load history:', err);
-      showToast(`Failed to load history: ${err.message}`, 'error');
-    }
-
-    // Open ONE persistent stream for this conversation
+    // StreamAgentStateUpdates delivers complete history in Chunk 0 — no redundant RPC calls
     startPersistentStream(id);
   };
 
@@ -472,13 +491,8 @@ export default function App() {
     setInputPrompt('');
 
     // 1. Snapshot current step count as the turn boundary for this message.
-    //    The persistent stream reads turnStartStepRef dynamically, so setting
-    //    this BEFORE sendMessage ensures the stream only routes new steps here.
-    let startStepIndex = 0;
-    try {
-      startStepIndex = await client.getRawStepCount(targetSessionId);
-    } catch { }
-    turnStartStepRef.current = startStepIndex;
+    //    Tracked directly from StreamAgentStateUpdates — zero extra network requests!
+    turnStartStepRef.current = totalStepsRef.current;
 
     // 2. Append user message & placeholder assistant turn
     setMessages(prev => [...prev, { role: 'user', content: currentPrompt }, { role: 'assistant', steps: [] }]);
