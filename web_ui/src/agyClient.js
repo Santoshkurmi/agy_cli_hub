@@ -144,22 +144,89 @@ export class AntigravityBrowserClient {
     return list.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
   }
 
-  // 6. Start a new session
-  async startConversation(modelEnum = 'MODEL_PLACEHOLDER_M319') {
+  // 6. List Registered Projects
+  async listProjects() {
+    if (!this.csrfToken) await this.initCsrfToken();
+    let projectIds = [];
+    const controller = new AbortController();
+    try {
+      const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/ProjectUpdatesStream`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({}),
+        signal: controller.signal
+      });
+      await this.parseStream(res.body, (json) => {
+        if (json.projectList?.projectIds) {
+          projectIds = json.projectList.projectIds;
+          controller.abort();
+        }
+      });
+    } catch {}
+
+    if (projectIds.length === 0) {
+      projectIds = ['default-cli-project', 'outside-of-project'];
+    }
+
+    try {
+      const readRes = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/ReadProjects`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({ ids: projectIds })
+      });
+      let projects = [];
+      await this.parseStream(readRes.body, (json) => {
+        if (json.projects) {
+          projects = json.projects.map(p => {
+            const folder = p.projectResources?.resources?.[0]?.folderUri || '';
+            return {
+              id: p.id,
+              name: p.name || p.id,
+              folderUri: folder,
+              path: folder.replace(/^file:\/\//, '')
+            };
+          });
+        }
+      });
+      return projects;
+    } catch {
+      return [];
+    }
+  }
+
+  // 7. Start a new session with explicit workspace folder & project
+  async startConversation(modelEnum = 'MODEL_PLACEHOLDER_M319', folderPath = '', projectId = '') {
     if (!this.csrfToken) await this.initCsrfToken();
     const cascadeId = (typeof crypto !== 'undefined' && crypto.randomUUID)
       ? crypto.randomUUID()
       : 'c-' + Math.random().toString(36).substring(2, 10) + '-' + Date.now();
 
+    const normalizedUri = folderPath
+      ? (folderPath.startsWith('file://') ? folderPath : `file://${folderPath}`)
+      : '';
+
     const payload = {
       source: 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
       cascadeId,
-      requestedModel: modelEnum || 'MODEL_PLACEHOLDER_M319',
-      projectEnvConfig: {
+      requestedModel: modelEnum || 'MODEL_PLACEHOLDER_M319'
+    };
+
+    // CRITICAL: agy rejects StartCascade if both workspaceUris and projectEnvConfig are passed together.
+    if (normalizedUri) {
+      payload.workspaceUris = [normalizedUri];
+      payload.overrideWorkspaceUris = [normalizedUri];
+    } else if (projectId && projectId !== 'default-cli-project' && projectId !== 'custom') {
+      payload.projectEnvConfig = {
+        projectId,
+        defaultProjectEnvironment: {}
+      };
+    } else {
+      payload.projectEnvConfig = {
         projectId: 'default-cli-project',
         defaultProjectEnvironment: {}
-      }
-    };
+      };
+    }
+
     const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/StartCascade`, {
       method: 'POST',
       headers: this.getHeaders(),
@@ -167,6 +234,44 @@ export class AntigravityBrowserClient {
     });
     if (!res.ok) throw new Error(`StartCascade failed: ${res.status}`);
     return cascadeId;
+  }
+
+  // 8. Update workspace folder & project mid-conversation
+  async setSessionWorkspace(cascadeId, folderPath = '', projectId = '', modelEnum = 'MODEL_PLACEHOLDER_M319') {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const normalizedUri = folderPath
+      ? (folderPath.startsWith('file://') ? folderPath : `file://${folderPath}`)
+      : '';
+
+    const payload = {
+      source: 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT',
+      cascadeId,
+      requestedModel: modelEnum || 'MODEL_PLACEHOLDER_M319'
+    };
+
+    // CRITICAL: agy rejects StartCascade if both workspaceUris and projectEnvConfig are passed together.
+    if (normalizedUri) {
+      payload.workspaceUris = [normalizedUri];
+      payload.overrideWorkspaceUris = [normalizedUri];
+    } else if (projectId && projectId !== 'default-cli-project' && projectId !== 'custom') {
+      payload.projectEnvConfig = {
+        projectId,
+        defaultProjectEnvironment: {}
+      };
+    } else {
+      payload.projectEnvConfig = {
+        projectId: 'default-cli-project',
+        defaultProjectEnvironment: {}
+      };
+    }
+
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/StartCascade`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: this.encodeFrame(payload)
+    });
+    if (!res.ok) throw new Error(`Update workspace failed: ${res.status}`);
+    return true;
   }
 
   // 7. Get raw step count for accurate turn offsetting

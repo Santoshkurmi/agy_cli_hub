@@ -427,3 +427,116 @@ body {
   align-items: center;
   gap: 6px;
 }
+
+/* Project Pill */
+.project-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.project-pill:hover {
+  border-color: var(--accent-blue);
+  background-color: #1a2333;
+}
+.project-pill-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-main);
+}
+.project-pill-path {
+  font-size: 11px;
+  color: var(--text-dim);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Project Modal Overlay */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-card {
+  background-color: var(--bg-sidebar);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  width: 92%;
+  max-width: 520px;
+  padding: 24px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.modal-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.project-option-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.project-option-item {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  transition: all 0.15s ease;
+}
+.project-option-item:hover {
+  background-color: #172236;
+  border-color: #3b82f6;
+}
+.project-option-item.selected {
+  background-color: #172846;
+  border-color: #3b82f6;
+}
+
+.message-system {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background-color: #111a2e;
+  border: 1px dashed #2563eb;
+  color: #93c5fd;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  margin: 4px auto;
+  max-width: 860px;
+  width: 100%;
+}
+

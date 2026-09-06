@@ -1,20 +1,24 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  MessageSquare, 
-  Plus, 
-  Send, 
-  Square, 
-  Brain, 
-  Terminal, 
-  Cpu, 
-  ChevronDown, 
+import {
+  MessageSquare,
+  Plus,
+  Send,
+  Square,
+  Brain,
+  Terminal,
+  Cpu,
+  ChevronDown,
   ChevronUp,
   Zap,
   Settings,
   RefreshCw,
   FileText,
   Search,
-  Code
+  Code,
+  Folder,
+  FolderGit2,
+  Check,
+  X
 } from 'lucide-react';
 import { AntigravityBrowserClient } from './agyClient';
 
@@ -29,7 +33,16 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState('');
   const [thinkingBudget, setThinkingBudget] = useState(8192);
   const [autoExecute, setAutoExecute] = useState(true);
+
+  // Projects and Workspace Folders
+  const [projects, setProjects] = useState([]);
+  const [selectedProjectId, setSelectedProjectId] = useState('default-cli-project');
   const [workspaceDir, setWorkspaceDir] = useState('/home/cat/agy_cli_hub');
+  const [showProjectModal, setShowProjectModal] = useState(false);
+  const [modalMode, setModalMode] = useState('new'); // 'new' | 'switch'
+  const [tempCustomPath, setTempCustomPath] = useState('/home/cat/agy_cli_hub');
+  const [tempSelectedProjectId, setTempSelectedProjectId] = useState('default-cli-project');
+
   const [messages, setMessages] = useState([]);
   const [inputPrompt, setInputPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
@@ -64,7 +77,7 @@ export default function App() {
       await client.initCsrfToken();
       setConnected(true);
 
-      // 1. Fetch available models (only once)
+      // 1. Fetch available models
       console.log('[UI] Fetching available models...');
       const availableModels = await client.getAvailableModels();
       setModels(availableModels);
@@ -73,7 +86,20 @@ export default function App() {
         setSelectedModel(preferred.modelEnum);
       }
 
-      // 2. Fetch conversations list (only once)
+      // 2. Fetch projects
+      console.log('[UI] Fetching registered projects...');
+      try {
+        const pList = await client.listProjects();
+        const defaultList = [
+          { id: 'agy-cli-hub', name: 'agy_cli_hub', path: '/home/cat/agy_cli_hub', folderUri: 'file:///home/cat/agy_cli_hub' },
+          ...pList.filter(p => p.path && p.path !== '/home/cat/agy_cli_hub')
+        ];
+        setProjects(defaultList);
+      } catch (err) {
+        console.warn('Failed to load projects:', err);
+      }
+
+      // 3. Fetch conversations list
       console.log('[UI] Fetching conversations list...');
       const convList = await client.listConversations();
       setConversations(convList);
@@ -86,22 +112,65 @@ export default function App() {
     }
   };
 
-  const createNewConversation = async () => {
-    try {
-      const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
-      const cascadeId = await client.startConversation(modelToUse);
-      const newChat = {
-        id: cascadeId,
-        title: 'New Session',
-        lastModified: new Date().toISOString(),
-        stepCount: 0
-      };
-      setConversations(prev => [newChat, ...prev]);
-      setActiveSessionId(cascadeId);
-      setMessages([]);
-    } catch (err) {
-      console.error('Failed to start session:', err);
-      alert(`Failed to start session: ${err.message}`);
+  const openNewSessionModal = () => {
+    setModalMode('new');
+    setTempCustomPath(workspaceDir || '/home/cat/agy_cli_hub');
+    setTempSelectedProjectId(selectedProjectId || 'default-cli-project');
+    setShowProjectModal(true);
+  };
+
+  const openSwitchProjectModal = () => {
+    setModalMode('switch');
+    setTempCustomPath(workspaceDir || '/home/cat/agy_cli_hub');
+    setTempSelectedProjectId(selectedProjectId || 'default-cli-project');
+    setShowProjectModal(true);
+  };
+
+  const handleConfirmProject = async (path, projId) => {
+    const finalPath = (path || '').trim() || '/home/cat/agy_cli_hub';
+    const finalProjId = projId || 'default-cli-project';
+    setWorkspaceDir(finalPath);
+    setSelectedProjectId(finalProjId);
+    setShowProjectModal(false);
+
+    const projObj = projects.find(p => p.id === finalProjId);
+    const projName = projObj?.name || finalPath.split('/').filter(Boolean).pop() || 'Workspace';
+
+    if (modalMode === 'new') {
+      try {
+        const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
+        const cascadeId = await client.startConversation(modelToUse, finalPath, finalProjId);
+        const newChat = {
+          id: cascadeId,
+          title: `Session (${projName})`,
+          lastModified: new Date().toISOString(),
+          stepCount: 0,
+          workspaceDir: finalPath,
+          projectId: finalProjId
+        };
+        setConversations(prev => [newChat, ...prev]);
+        setActiveSessionId(cascadeId);
+        setMessages([
+          { role: 'system', content: `Workspace initialized: ${finalPath} [${projName}]` }
+        ]);
+      } catch (err) {
+        console.error('Failed to start session:', err);
+        alert(`Failed to start session: ${err.message}`);
+      }
+    } else if (modalMode === 'switch') {
+      if (activeSessionId) {
+        try {
+          const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
+          await client.setSessionWorkspace(activeSessionId, finalPath, finalProjId, modelToUse);
+          setMessages(prev => [
+            ...prev,
+            { role: 'system', content: `Workspace switched to: ${finalPath} (${projName})` }
+          ]);
+        } catch (err) {
+          console.error('Failed to update workspace:', err);
+          alert(`Failed to switch workspace: ${err.message}`);
+        }
+      }
     }
   };
 
@@ -127,13 +196,17 @@ export default function App() {
 
     let targetSessionId = activeSessionId;
     if (!targetSessionId) {
-      targetSessionId = await client.startConversation(modelToUse);
+      targetSessionId = await client.startConversation(modelToUse, workspaceDir, selectedProjectId);
       setActiveSessionId(targetSessionId);
+      const projObj = projects.find(p => p.id === selectedProjectId);
+      const projName = projObj?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace';
       setConversations(prev => [{
         id: targetSessionId,
         title: inputPrompt.slice(0, 30),
         lastModified: new Date().toISOString(),
-        stepCount: 1
+        stepCount: 1,
+        workspaceDir,
+        projectId: selectedProjectId
       }, ...prev]);
     }
 
@@ -144,7 +217,7 @@ export default function App() {
     let startStepIndex = 0;
     try {
       startStepIndex = await client.getRawStepCount(targetSessionId);
-    } catch {}
+    } catch { }
 
     // 2. Append user message & placeholder assistant turn
     const userMsg = { role: 'user', content: currentPrompt };
@@ -261,15 +334,15 @@ export default function App() {
             <span>Antigravity UI</span>
             <span className="logo-badge">Direct Hub</span>
           </div>
-          <button className="btn-new-chat" onClick={createNewConversation}>
+          <button className="btn-new-chat" onClick={openNewSessionModal}>
             <Plus size={16} /> New Session
           </button>
         </div>
 
         <div className="chat-list">
           {conversations.map(chat => (
-            <div 
-              key={chat.id} 
+            <div
+              key={chat.id}
               className={`chat-item ${chat.id === activeSessionId ? 'active' : ''}`}
               onClick={() => selectConversation(chat.id)}
             >
@@ -299,6 +372,22 @@ export default function App() {
               <Settings size={12} style={{ marginLeft: 4 }} />
             </div>
 
+            {/* Project / Workspace Switcher Pill */}
+            <div
+              className="project-pill"
+              onClick={openSwitchProjectModal}
+              title="Click to switch workspace folder or project (even mid-conversation)"
+            >
+              <Folder size={14} color="#38bdf8" />
+              <span className="project-pill-title">
+                {projects.find(p => p.id === selectedProjectId)?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace'}
+              </span>
+              <span className="project-pill-path">
+                {workspaceDir ? workspaceDir.split('/').slice(-2).join('/') : ''}
+              </span>
+              <ChevronDown size={12} color="#64748b" />
+            </div>
+
             {activeModelObj?.quotaFraction !== undefined && (
               <div className="status-badge" style={{ color: '#38bdf8' }}>
                 Quota: {Math.round(activeModelObj.quotaFraction * 100)}%
@@ -310,7 +399,7 @@ export default function App() {
             {/* Model Selector */}
             <div className="control-group">
               <Cpu size={14} />
-              <select 
+              <select
                 className="select-control"
                 value={selectedModel}
                 onChange={(e) => setSelectedModel(e.target.value)}
@@ -328,10 +417,10 @@ export default function App() {
               <Brain size={14} />
               <span>Thinking:</span>
               <div className="slider-container">
-                <input 
-                  type="range" 
-                  min="0" 
-                  max="32768" 
+                <input
+                  type="range"
+                  min="0"
+                  max="32768"
                   step="2048"
                   value={thinkingBudget}
                   onChange={(e) => setThinkingBudget(e.target.value)}
@@ -346,8 +435,8 @@ export default function App() {
             <div className="control-group">
               <Terminal size={14} />
               <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-                <input 
-                  type="checkbox" 
+                <input
+                  type="checkbox"
                   checked={autoExecute}
                   onChange={(e) => setAutoExecute(e.target.checked)}
                 />
@@ -362,19 +451,19 @@ export default function App() {
           <div style={{ padding: '8px 20px', background: '#111722', borderBottom: '1px solid #243147', display: 'flex', alignItems: 'center', gap: '14px', flexWrap: 'wrap' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
               <span style={{ fontSize: '12px', color: '#94a3b8' }}>Hub URL:</span>
-              <input 
-                type="text" 
-                value={hubUrl} 
-                onChange={(e) => setHubUrl(e.target.value)} 
+              <input
+                type="text"
+                value={hubUrl}
+                onChange={(e) => setHubUrl(e.target.value)}
                 style={{ background: '#161f30', border: '1px solid #243147', color: '#f1f5f9', padding: '4px 8px', borderRadius: 4, fontSize: '12px', width: '200px' }}
               />
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
               <span style={{ fontSize: '12px', color: '#94a3b8' }}>Workspace Folder:</span>
-              <input 
-                type="text" 
-                value={workspaceDir} 
-                onChange={(e) => setWorkspaceDir(e.target.value)} 
+              <input
+                type="text"
+                value={workspaceDir}
+                onChange={(e) => setWorkspaceDir(e.target.value)}
                 style={{ background: '#161f30', border: '1px solid #243147', color: '#f1f5f9', padding: '4px 8px', borderRadius: 4, fontSize: '12px', width: '240px' }}
               />
             </div>
@@ -388,7 +477,12 @@ export default function App() {
         <div className="messages-container">
           {messages.map((msg, idx) => (
             <div key={idx} className="message-row">
-              {msg.role === 'user' ? (
+              {msg.role === 'system' ? (
+                <div className="message-system">
+                  <Folder size={14} color="#38bdf8" />
+                  <span>{msg.content}</span>
+                </div>
+              ) : msg.role === 'user' ? (
                 <div className="message-user">{msg.content}</div>
               ) : (
                 <div className="message-assistant">
@@ -425,8 +519,8 @@ export default function App() {
                         const isCollapsed = collapsedTools[toolKey];
                         return (
                           <div key={sIdx} className="tool-box">
-                            <div 
-                              className="tool-header" 
+                            <div
+                              className="tool-header"
                               onClick={() => toggleTool(toolKey)}
                               style={{ cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
                             >
@@ -521,8 +615,8 @@ export default function App() {
                 <Square size={14} /> Stop
               </button>
             ) : (
-              <button 
-                type="submit" 
+              <button
+                type="submit"
                 className="send-button"
                 disabled={!inputPrompt.trim() || !connected}
               >
@@ -532,6 +626,113 @@ export default function App() {
           </form>
         </div>
       </div>
+
+      {/* Project & Workspace Selection Modal */}
+      {showProjectModal && (
+        <div className="modal-overlay" onClick={() => setShowProjectModal(false)}>
+          <div className="modal-card" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="modal-title">
+                <Folder size={20} color="#38bdf8" />
+                <span>{modalMode === 'new' ? 'Choose Project & Workspace' : 'Switch Workspace Mid-Conversation'}</span>
+              </div>
+              <button
+                onClick={() => setShowProjectModal(false)}
+                style={{ background: 'transparent', border: 'none', color: '#94a3b8', cursor: 'pointer', display: 'flex' }}
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div style={{ fontSize: '13px', color: '#94a3b8', lineHeight: 1.5 }}>
+              {modalMode === 'new'
+                ? 'Choose which project or workspace folder this new conversation should belong to. Tool actions (file edits, terminal commands) will execute inside this directory.'
+                : 'Change the active working directory for this conversation. Subsequent commands and file operations will immediately target the new path.'}
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <span style={{ fontSize: '12px', fontWeight: 600, color: '#cbd5e1' }}>Available Registered Projects:</span>
+              <div className="project-option-list">
+                {projects.map((p) => {
+                  const isSel = tempSelectedProjectId === p.id && tempCustomPath === (p.path || tempCustomPath);
+                  return (
+                    <div
+                      key={p.id}
+                      className={`project-option-item ${isSel ? 'selected' : ''}`}
+                      onClick={() => {
+                        setTempSelectedProjectId(p.id);
+                        if (p.path) setTempCustomPath(p.path);
+                      }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                        <FolderGit2 size={18} color={isSel ? '#38bdf8' : '#64748b'} />
+                        <div>
+                          <div style={{ fontSize: '13px', fontWeight: 600, color: '#f1f5f9' }}>{p.name}</div>
+                          <div style={{ fontSize: '11px', color: '#64748b' }}>{p.path || 'Global / Default Workspace'}</div>
+                        </div>
+                      </div>
+                      {isSel && <Check size={16} color="#38bdf8" />}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <span style={{ fontSize: '12px', color: '#cbd5e1', fontWeight: 600 }}>Working Directory Path:</span>
+              <input
+                type="text"
+                value={tempCustomPath}
+                onChange={(e) => setTempCustomPath(e.target.value)}
+                placeholder="/home/cat/path/to/project"
+                style={{
+                  background: '#161f30',
+                  border: '1px solid #243147',
+                  color: '#f1f5f9',
+                  padding: '8px 12px',
+                  borderRadius: 6,
+                  fontSize: '13px',
+                  outline: 'none'
+                }}
+              />
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '6px' }}>
+              <button
+                type="button"
+                onClick={() => setShowProjectModal(false)}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid #243147',
+                  color: '#94a3b8',
+                  padding: '8px 14px',
+                  borderRadius: 6,
+                  fontSize: '13px',
+                  cursor: 'pointer'
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => handleConfirmProject(tempCustomPath, tempSelectedProjectId)}
+                style={{
+                  background: 'linear-gradient(135deg, #2563eb, #1d4ed8)',
+                  border: 'none',
+                  color: '#fff',
+                  padding: '8px 16px',
+                  borderRadius: 6,
+                  fontSize: '13px',
+                  fontWeight: 600,
+                  cursor: 'pointer'
+                }}
+              >
+                {modalMode === 'new' ? 'Start Session' : 'Apply Workspace Change'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
