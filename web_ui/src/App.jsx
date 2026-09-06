@@ -449,7 +449,9 @@ export default function App() {
     if (!activeSessionId) return;
     try {
       showToast('Forking conversation...', 'info');
-      const newCascadeId = await client.forkConversation(activeSessionId);
+      // Pass the highest step index so the entire conversation up to the current turn is branched!
+      const currentHighestStep = totalStepsRef.current > 0 ? (totalStepsRef.current - 1) : null;
+      const newCascadeId = await client.forkConversation(activeSessionId, currentHighestStep, workspaceDir, selectedProjectId);
       if (newCascadeId) {
         saveSessionWorkspace(newCascadeId, workspaceDir, selectedProjectId);
         const currentConv = conversations.find(c => c.id === activeSessionId);
@@ -473,25 +475,110 @@ export default function App() {
     }
   };
 
-  // 5. Revert Conversation Back to Specific Step
-  const handleRevertTurn = async (targetStepIndex) => {
+  // Branch conversation from a specific turn
+  const handleForkFromTurn = async (targetStepIndex) => {
     if (!activeSessionId || targetStepIndex === undefined) return;
-    const confirm = window.confirm(`Revert conversation back to step #${targetStepIndex}? Future actions from this turn onward will be undone.`);
+    try {
+      showToast(`Branching conversation from step #${targetStepIndex}...`, 'info');
+      const newCascadeId = await client.forkConversation(activeSessionId, targetStepIndex, workspaceDir, selectedProjectId);
+      if (newCascadeId) {
+        saveSessionWorkspace(newCascadeId, workspaceDir, selectedProjectId);
+        const currentConv = conversations.find(c => c.id === activeSessionId);
+        const newTitle = currentConv ? `[Branch @#${targetStepIndex}] ${currentConv.title}` : 'Branched Session';
+
+        setConversations(prev => [{
+          id: newCascadeId,
+          title: newTitle,
+          lastModified: new Date().toISOString(),
+          stepCount: targetStepIndex + 1,
+          workspaceDir,
+          projectId: selectedProjectId
+        }, ...prev]);
+
+        selectConversation(newCascadeId);
+        showToast(`Branched conversation from step #${targetStepIndex}!`, 'success');
+      }
+    } catch (err) {
+      console.error('Failed to branch from turn:', err);
+      showToast(`Branch failed: ${err.message}`, 'error');
+    }
+  };
+
+  // 5. Revert Last Message: removes from chat/daemon and restores text to input box
+  const handleRevertLastTurn = async () => {
+    if (!activeSessionId) return;
+
+    let lastUserMsg = null;
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        lastUserMsg = messages[i];
+        lastUserIdx = i;
+        break;
+      }
+    }
+
+    if (!lastUserMsg) return;
+
+    const confirm = window.confirm('Revert the last message and restore it to the input box?');
     if (!confirm) return;
 
     try {
-      showToast(`Reverting to step #${targetStepIndex}...`, 'info');
-      await client.revertToCascadeStep(activeSessionId, targetStepIndex);
+      showToast('Reverting last message...', 'info');
 
-      turnStartStepRef.current = targetStepIndex;
-      totalStepsRef.current = targetStepIndex;
+      // 1. Immediately abort active stream so incoming updates do not conflict
+      if (streamControllerRef.current) {
+        streamControllerRef.current.abort();
+        streamControllerRef.current = null;
+      }
 
-      // Reconnect persistent stream to load the reverted state
-      startPersistentStream(activeSessionId);
-      showToast(`Successfully reverted to step #${targetStepIndex}`, 'success');
+      // 2. Restore message content and any attachments into input box
+      if (lastUserMsg.content) {
+        setInputPrompt(lastUserMsg.content);
+      }
+      if (lastUserMsg.files && lastUserMsg.files.length > 0) {
+        setAttachedFiles(lastUserMsg.files);
+      }
+      if (lastUserMsg.audio) {
+        setAttachedAudio(lastUserMsg.audio);
+      }
+
+      // 3. Revert on the daemon using client.revertLastUserMessage
+      const result = await client.revertLastUserMessage(activeSessionId, selectedModel, autoExecutionPolicy);
+
+      if (result.isReset) {
+        // Only 1 user message existed: reset conversation back to initial workspace ready state
+        const projObj = projects.find(p => p.id === selectedProjectId);
+        const projName = projObj?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace';
+        setMessages([
+          { role: 'system', content: `Workspace ready: ${workspaceDir} [${projName}]. Type a message to begin.` }
+        ]);
+        turnStartStepRef.current = 0;
+        totalStepsRef.current = 0;
+        setIsGenerating(false);
+        isGeneratingRef.current = false;
+        // Clean up empty trajectory from server & sidebar
+        client.deleteCascadeTrajectory(activeSessionId).catch(() => {});
+        setConversations(prev => prev.filter(c => c.id !== activeSessionId));
+        setActiveSessionId(null);
+        showToast('Message undone and restored to input box!', 'success');
+      } else {
+        // Prune the undone user message and its assistant response immediately from local UI
+        setMessages(prev => prev.slice(0, lastUserIdx));
+        turnStartStepRef.current = result.revertedToStep;
+        totalStepsRef.current = result.revertedToStep + 1;
+        setIsGenerating(false);
+        isGeneratingRef.current = false;
+
+        // Reconnect stream cleanly to receive the accurate truncated server state
+        startPersistentStream(activeSessionId);
+        showToast('Message undone and restored to input box!', 'success');
+      }
     } catch (err) {
-      console.error('Failed to revert:', err);
+      console.error('Failed to revert last message:', err);
       showToast(`Revert failed: ${err.message}`, 'error');
+      // If error, reconnect stream so chat is restored
+      startPersistentStream(activeSessionId);
     }
   };
 
@@ -1007,14 +1094,25 @@ export default function App() {
           turnStartStepRef.current = update.currentTurnStartStep !== undefined
             ? update.currentTurnStartStep
             : (update.totalLength || 0);
-          if (update.messages && update.messages.length > 0) {
-            setMessages(update.messages);
+
+          // Only sync messages from init chunk if we are NOT in the middle of sending/generating a message!
+          if (!isGeneratingRef.current) {
+            if (update.messages && update.messages.length > 0) {
+              setMessages(update.messages);
+            } else if (update.messages && update.messages.length === 0) {
+              const projObj = projects.find(p => p.id === selectedProjectId);
+              const projName = projObj?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace';
+              setMessages([
+                { role: 'system', content: `Workspace ready: ${workspaceDir} [${projName}]. Type a message to begin.` }
+              ]);
+            }
           }
+
           setIsLoadingChat(false);
           if (update.isRunning) {
             setIsGenerating(true);
             isGeneratingRef.current = true;
-          } else {
+          } else if (!isGeneratingRef.current) {
             setIsGenerating(false);
             isGeneratingRef.current = false;
           }
@@ -1286,6 +1384,24 @@ export default function App() {
     setInputPrompt('');
     setAttachedAudio(null);
     setAttachedFiles([]);
+    isGeneratingRef.current = true;
+    setIsGenerating(true);
+
+    // 1. Snapshot current step count as the turn boundary for this message.
+    turnStartStepRef.current = totalStepsRef.current;
+
+    // 2. Append user message & placeholder assistant turn immediately
+    setMessages(prev => [
+      ...prev.filter(m => m.role !== 'system'),
+      {
+        role: 'user',
+        content: currentPrompt,
+        audio: currentAudio,
+        files: currentFiles,
+        stepIndex: totalStepsRef.current
+      },
+      { role: 'assistant', steps: [] }
+    ]);
 
     const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
 
@@ -1311,6 +1427,8 @@ export default function App() {
       } catch (startErr) {
         console.error('Failed to create session:', startErr);
         showToast(`Failed to create session: ${startErr.message}`, 'error');
+        setIsGenerating(false);
+        isGeneratingRef.current = false;
         return;
       }
     }
@@ -1320,23 +1438,6 @@ export default function App() {
     const actualText = isPlan
       ? currentPrompt.trim().replace(/^\/plan\s*/i, '') || 'Create a comprehensive implementation plan'
       : currentPrompt;
-
-    // 1. Snapshot current step count as the turn boundary for this message.
-    turnStartStepRef.current = totalStepsRef.current;
-
-    // 2. Append user message & placeholder assistant turn
-    setMessages(prev => [
-      ...prev.filter(m => m.role !== 'system'),
-      {
-        role: 'user',
-        content: currentPrompt,
-        audio: currentAudio,
-        files: currentFiles
-      },
-      { role: 'assistant', steps: [] }
-    ]);
-    isGeneratingRef.current = true;
-    setIsGenerating(true);
 
     try {
       const imagePayload = currentFiles.filter(f => f.isImage).map(f => ({ value: f.base64 }));
@@ -1977,7 +2078,15 @@ export default function App() {
               <span>Loading conversation history...</span>
             </div>
           ) : (
-            messages.map((msg, idx) => (
+            (() => {
+              let lastUserIdx = -1;
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if (messages[i].role === 'user') {
+                  lastUserIdx = i;
+                  break;
+                }
+              }
+              return messages.map((msg, idx) => (
             <div key={idx} className="message-row">
               {msg.role === 'system' ? (
                 <div className="message-system">
@@ -2016,15 +2125,29 @@ export default function App() {
                       </div>
                     )}
                   </div>
-                  {activeSessionId && idx > 0 && (
-                    <button
-                      type="button"
-                      className="btn-revert-turn"
-                      onClick={() => handleRevertTurn(msg.stepIndex || 0)}
-                      title="Revert conversation back to this turn"
-                    >
-                      <RotateCcw size={10} /> Revert
-                    </button>
+                  {activeSessionId && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      {idx > 0 && (
+                        <button
+                          type="button"
+                          className="btn-revert-turn"
+                          onClick={() => handleForkFromTurn(msg.stepIndex ?? (idx > 0 ? idx - 1 : 0))}
+                          title="Branch conversation from this turn into a new session"
+                        >
+                          <GitBranch size={10} /> Fork
+                        </button>
+                      )}
+                      {idx === lastUserIdx && (
+                        <button
+                          type="button"
+                          className="btn-revert-turn"
+                          onClick={handleRevertLastTurn}
+                          title="Undo this message and restore it to the input box"
+                        >
+                          <RotateCcw size={10} /> Revert
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               ) : (
@@ -2414,7 +2537,9 @@ export default function App() {
                 </div>
               )}
             </div>
-          )))}
+          ));
+        })()
+      )}
           <div ref={messagesEndRef} />
         </div>
 

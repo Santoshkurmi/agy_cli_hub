@@ -1596,15 +1596,35 @@ export class AntigravityBrowserClient {
     return data.commands || [];
   }
 
-  // 15. Fork conversation up to a given step
-  async forkConversation(sourceCascadeId, revertToStep = null) {
+  // 15. Fork conversation up to a given step (or all current steps if omitted)
+  async forkConversation(sourceCascadeId, forkAtStepIndex = null, folderPath = '', projectId = '') {
     if (!this.csrfToken) await this.initCsrfToken();
-    const payload = {
-      source_cascade_id: sourceCascadeId
-    };
-    if (revertToStep !== null && revertToStep !== undefined) {
-      payload.revert_to_step = Number(revertToStep);
+
+    let rawCount = 0;
+    try {
+      rawCount = await this.getRawStepCount(sourceCascadeId);
+    } catch (e) {
+      console.warn('Could not get raw step count for fork:', e);
     }
+
+    // A conversation with 0 steps cannot be forked by the daemon (fails with "fork_at_step_index 0 is out of bounds (trajectory has 0 steps)").
+    // Forking an empty/new session is simply starting a fresh session in the same workspace.
+    if (rawCount <= 0) {
+      return await this.startConversation('MODEL_PLACEHOLDER_M319', folderPath, projectId);
+    }
+
+    let targetStep = forkAtStepIndex;
+    if (targetStep === null || targetStep === undefined) {
+      targetStep = rawCount - 1;
+    } else {
+      targetStep = Math.max(0, Math.min(Number(targetStep), rawCount - 1));
+    }
+
+    const payload = {
+      sourceCascadeId: sourceCascadeId,
+      forkAtStepIndex: Number(targetStep)
+    };
+
     const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/ForkConversation`, {
       method: 'POST',
       headers: {
@@ -1613,27 +1633,121 @@ export class AntigravityBrowserClient {
       },
       body: JSON.stringify(payload)
     });
-    this.checkResponse(res);
+    if (!res.ok) {
+      const errText = await res.text();
+      let errMsg = `HTTP error: ${res.status}`;
+      try {
+        const errJson = JSON.parse(errText);
+        if (errJson.message) errMsg = errJson.message;
+      } catch {}
+      throw new Error(errMsg);
+    }
     const data = await res.json();
     return data.newCascadeId || null;
   }
 
   // 16. Revert conversation back to stepIndex
-  async revertToCascadeStep(cascadeId, stepIndex) {
+  async revertToCascadeStep(cascadeId, stepIndex, modelEnum = 'MODEL_PLACEHOLDER_M319', autoExecutionPolicy = 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER') {
     if (!this.csrfToken) await this.initCsrfToken();
+
+    let rawCount = 0;
+    try {
+      rawCount = await this.getRawStepCount(cascadeId);
+    } catch (e) {
+      console.warn('Could not get raw step count for revert:', e);
+    }
+
+    if (rawCount <= 0) {
+      throw new Error('Cannot revert a conversation with no recorded steps.');
+    }
+
+    // Clamp stepIndex strictly within [0, rawCount - 1] to prevent out-of-bounds error
+    const safeStep = Math.max(0, Math.min(Number(stepIndex ?? 0), rawCount - 1));
+
+    let policy = autoExecutionPolicy;
+    if (policy === 'EAGER') policy = 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER';
+    else if (policy === 'AUTO') policy = 'CASCADE_COMMANDS_AUTO_EXECUTION_AUTO';
+    else if (policy === 'OFF') policy = 'CASCADE_COMMANDS_AUTO_EXECUTION_OFF';
+
+    const payload = {
+      cascadeId,
+      stepIndex: safeStep,
+      overrideConfig: {
+        plannerConfig: {
+          toolConfig: {
+            runCommand: {
+              autoCommandConfig: {
+                autoExecutionPolicy: policy || 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER'
+              }
+            },
+            notifyUser: {}
+          },
+          requestedModel: {
+            model: modelEnum || 'MODEL_PLACEHOLDER_M319'
+          },
+          knowledgeConfig: {},
+          useAiCredits: false,
+          supportsLatexRendering: true
+        },
+        conversationHistoryConfig: {}
+      }
+    };
+
     const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/RevertToCascadeStep`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-codeium-csrf-token': this.csrfToken
       },
-      body: JSON.stringify({
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      let errMsg = `HTTP error: ${res.status}`;
+      try {
+        const errJson = JSON.parse(errText);
+        if (errJson.message) errMsg = errJson.message;
+      } catch {}
+      throw new Error(errMsg);
+    }
+    return true;
+  }
+
+  // 16b. Revert the entire last user message turn and remove it from daemon trajectory
+  async revertLastUserMessage(cascadeId, modelEnum = 'MODEL_PLACEHOLDER_M319', autoExecutionPolicy = 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER') {
+    if (!this.csrfToken) await this.initCsrfToken();
+
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetCascadeTrajectorySteps`, {
+      method: 'POST',
+      headers: this.getHeaders(),
+      body: this.encodeFrame({
         cascade_id: cascadeId,
-        step_index: Number(stepIndex)
+        trajectory_verbosity: 2
       })
     });
     this.checkResponse(res);
-    return res.ok;
+
+    const steps = [];
+    await this.parseStream(res.body, (json) => {
+      if (json.steps) steps.push(...json.steps);
+    });
+
+    let lastUserIdx = -1;
+    for (let i = steps.length - 1; i >= 0; i--) {
+      if (steps[i].userInput) {
+        lastUserIdx = i;
+        break;
+      }
+    }
+
+    // If there is no user input or it is the very first step in the conversation:
+    if (lastUserIdx <= 0) {
+      return { isReset: true, revertedToStep: -1 };
+    }
+
+    const targetStep = lastUserIdx - 1;
+    await this.revertToCascadeStep(cascadeId, targetStep, modelEnum, autoExecutionPolicy);
+    return { isReset: false, revertedToStep: targetStep };
   }
 
   // 17. Watch live Git VCS state stream
