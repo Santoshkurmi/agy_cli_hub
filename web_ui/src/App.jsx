@@ -200,6 +200,12 @@ export default function App() {
   const [showQuotaModal, setShowQuotaModal] = useState(false);
   const [isRefreshingQuota, setIsRefreshingQuota] = useState(false);
 
+  // Auth & User Profile States
+  const [authStatus, setAuthStatus] = useState(null);   // { hasValidAuth, grantedScopes }
+  const [userInfo, setUserInfo] = useState(null);        // { username, homeDirUri }
+  const [showProfileMenu, setShowProfileMenu] = useState(false);
+  const profileMenuRef = useRef(null);
+
   // Sidebar Search States
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
@@ -982,11 +988,24 @@ export default function App() {
         setShowTasksModal(false);
         setShowProjectModal(false);
         setSlashMenuOpen(false);
+        setShowProfileMenu(false);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
+
+  // Close profile menu on outside click
+  useEffect(() => {
+    if (!showProfileMenu) return;
+    const handleOutside = (e) => {
+      if (profileMenuRef.current && !profileMenuRef.current.contains(e.target)) {
+        setShowProfileMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, [showProfileMenu]);
 
   // Initial connect & load (runs once on mount, guarded against duplicate executions)
   useEffect(() => {
@@ -1020,6 +1039,18 @@ export default function App() {
         }
       }
       fetchQuotaSummary();
+
+      // Fetch auth & user info
+      try {
+        const [authRes, userRes] = await Promise.all([
+          client.getAuthStatus(),
+          client.getLocalUserInfo()
+        ]);
+        setAuthStatus(authRes);
+        setUserInfo(userRes);
+      } catch (err) {
+        console.warn('[UI] Could not fetch auth/user info:', err);
+      }
 
       // 2. Fetch projects
       console.log('[UI] Fetching registered projects...');
@@ -2115,6 +2146,80 @@ export default function App() {
                 <option value="AUTO">🛡️ Smart Safety (Auto)</option>
                 <option value="OFF">✋ Ask User (Off)</option>
               </select>
+            </div>
+
+            {/* Profile Avatar Button */}
+            <div className="profile-menu-wrap" ref={profileMenuRef}>
+              <button
+                type="button"
+                id="profile-menu-btn"
+                className={`profile-avatar-btn ${authStatus?.hasValidAuth ? 'logged-in' : 'logged-out'}`}
+                onClick={() => setShowProfileMenu(v => !v)}
+                title={authStatus?.hasValidAuth ? `Logged in as ${userInfo?.username || 'user'}` : 'Not logged in'}
+              >
+                <span className="profile-avatar-initials">
+                  {userInfo?.username ? userInfo.username.slice(0, 2).toUpperCase() : '??'}
+                </span>
+                <span className={`profile-auth-dot ${authStatus?.hasValidAuth ? 'auth-ok' : 'auth-no'}`} />
+              </button>
+
+              {showProfileMenu && (
+                <div className="profile-dropdown" id="profile-dropdown">
+                  <div className="profile-dropdown-header">
+                    <div className="profile-dropdown-avatar">
+                      {userInfo?.username ? userInfo.username.slice(0, 2).toUpperCase() : '??'}
+                    </div>
+                    <div className="profile-dropdown-info">
+                      <span className="profile-dropdown-name">{userInfo?.username || 'Unknown'}</span>
+                      <span className={`profile-dropdown-status ${authStatus?.hasValidAuth ? 'status-ok' : 'status-no'}`}>
+                        {authStatus?.hasValidAuth ? '● Authenticated' : '○ Not logged in'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {authStatus?.hasValidAuth && authStatus?.grantedScopes?.length > 0 && (
+                    <div className="profile-dropdown-scopes">
+                      <span className="profile-scopes-label">Active Scopes</span>
+                      <div className="profile-scopes-list">
+                        {authStatus.grantedScopes.slice(0, 4).map(s => (
+                          <span key={s} className="profile-scope-chip">{s.split('/').pop()}</span>
+                        ))}
+                        {authStatus.grantedScopes.length > 4 && (
+                          <span className="profile-scope-chip">+{authStatus.grantedScopes.length - 4} more</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="profile-dropdown-divider" />
+
+                  {authStatus?.hasValidAuth ? (
+                    <button
+                      type="button"
+                      id="profile-logout-btn"
+                      className="profile-dropdown-action logout"
+                      onClick={() => {
+                        setShowProfileMenu(false);
+                        showToast('To log out, run: agy logout in your terminal.', 'info');
+                      }}
+                    >
+                      <X size={14} /> Log Out
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      id="profile-login-btn"
+                      className="profile-dropdown-action login"
+                      onClick={() => {
+                        setShowProfileMenu(false);
+                        showToast('To log in, run: agy login in your terminal.', 'info');
+                      }}
+                    >
+                      <CheckCircle2 size={14} /> Log In
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>

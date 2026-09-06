@@ -1820,4 +1820,55 @@ export class AntigravityBrowserClient {
       return '';
     }
   }
+
+  // 20. Check if user has a valid auth token
+  async hasAuthToken() {
+    if (!this.csrfToken) await this.initCsrfToken();
+    try {
+      const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/HasAuthToken`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({})
+      });
+      const chunks = [];
+      await this.parseStream(res.body, (json) => chunks.push(json));
+      return chunks[0]?.hasToken === true;
+    } catch {
+      return false;
+    }
+  }
+
+  // 21. Get auth status (hasValidAuth + granted scopes)
+  async getAuthStatus() {
+    if (!this.csrfToken) await this.initCsrfToken();
+    try {
+      const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetAuthStatus`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({})
+      });
+      const chunks = [];
+      await this.parseStream(res.body, (json) => chunks.push(json));
+      return chunks[0]?.authResult || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // 22. Get local user info (username, homeDirUri)
+  async getLocalUserInfo() {
+    if (!this.csrfToken) await this.initCsrfToken();
+    try {
+      const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetLocalUserInfo`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({})
+      });
+      const chunks = [];
+      await this.parseStream(res.body, (json) => chunks.push(json));
+      return chunks[0] || null;
+    } catch {
+      return null;
+    }
+  }
 }
