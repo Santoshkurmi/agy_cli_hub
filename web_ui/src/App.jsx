@@ -143,11 +143,35 @@ const saveSessionWorkspace = (sessionId, path, projId) => {
   }
 };
 
+// Helper to parse sessionId or route from current URL path
+function getSessionIdFromUrl() {
+  if (typeof window === 'undefined') return null;
+  const pathname = window.location.pathname.replace(/^\/c\//, '/');
+  const match = pathname.match(/^\/([0-9a-fA-F-]{36})$/);
+  if (match) return match[1];
+  if (pathname === '/new') return 'new';
+  return null;
+}
+
+// Helper to update browser URL without triggering a full page refresh
+function updateUrlForSession(sessionId, replace = false) {
+  if (typeof window === 'undefined') return;
+  const targetPath = sessionId ? `/${sessionId}` : '/new';
+  if (window.location.pathname !== targetPath) {
+    if (replace) {
+      window.history.replaceState(null, '', targetPath);
+    } else {
+      window.history.pushState(null, '', targetPath);
+    }
+  }
+}
+
 export default function App() {
+  const initialUrlId = getSessionIdFromUrl();
   const [hubUrl, setHubUrl] = useState('http://127.0.0.1:8090');
   const [connected, setConnected] = useState(false);
   const [conversations, setConversations] = useState([]);
-  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [activeSessionId, setActiveSessionId] = useState(initialUrlId && initialUrlId !== 'new' ? initialUrlId : null);
   const [models, setModels] = useState([]);
   const [selectedModel, setSelectedModel] = useState(() => {
     return localStorage.getItem('agy_preferred_model_enum') || '';
@@ -246,12 +270,48 @@ export default function App() {
   const turnStartStepRef = useRef(0);        // updated before each sendMessage
   const totalStepsRef = useRef(0);           // tracked from StreamAgentStateUpdates
   const isGeneratingRef = useRef(false);
-  const activeSessionIdRef = useRef(activeSessionId);
-  const hasInitialSelectedRef = useRef(false);
+  const activeSessionIdRef = useRef(initialUrlId && initialUrlId !== 'new' ? initialUrlId : null);
+  const hasInitialSelectedRef = useRef(Boolean(initialUrlId));
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  // Load conversation from URL on initial mount if a specific session ID is in the URL
+  useEffect(() => {
+    const urlSession = getSessionIdFromUrl();
+    if (urlSession && urlSession !== 'new') {
+      selectConversation(urlSession, false);
+    }
+  }, []);
+
+  // Handle browser Back / Forward navigation (popstate)
+  useEffect(() => {
+    const handlePopState = () => {
+      const urlSession = getSessionIdFromUrl();
+      if (urlSession === 'new' || !urlSession) {
+        if (streamControllerRef.current) {
+          streamControllerRef.current.abort();
+          streamControllerRef.current = null;
+        }
+        setActiveSessionId(null);
+        turnStartStepRef.current = 0;
+        totalStepsRef.current = 0;
+        setIsGenerating(false);
+        isGeneratingRef.current = false;
+        const projObj = projects.find(p => p.id === selectedProjectId);
+        const projName = projObj?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace';
+        setMessages([
+          { role: 'system', content: `Workspace ready: ${workspaceDir} [${projName}]. Type a message to begin.` }
+        ]);
+      } else if (urlSession && urlSession !== activeSessionIdRef.current) {
+        selectConversation(urlSession, false);
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [workspaceDir, selectedProjectId, projects]);
 
   const [expandedProjects, setExpandedProjects] = useState({});
   const toggleProjectExpand = (projId) => {
@@ -561,6 +621,7 @@ export default function App() {
         client.deleteCascadeTrajectory(activeSessionId).catch(() => {});
         setConversations(prev => prev.filter(c => c.id !== activeSessionId));
         setActiveSessionId(null);
+        updateUrlForSession(null);
         showToast('Message undone and restored to input box!', 'success');
       } else {
         // Prune the undone user message and its assistant response immediately from local UI
@@ -1016,9 +1077,17 @@ export default function App() {
 
           const sorted = Array.from(map.values()).sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
 
-          if (!hasInitialSelectedRef.current && !activeSessionIdRef.current && sorted.length > 0) {
-            hasInitialSelectedRef.current = true;
-            selectConversation(sorted[0].id);
+          if (!hasInitialSelectedRef.current && !activeSessionIdRef.current) {
+            const urlTarget = getSessionIdFromUrl();
+            if (urlTarget === 'new') {
+              hasInitialSelectedRef.current = true;
+            } else if (urlTarget && sorted.some(s => s.id === urlTarget)) {
+              hasInitialSelectedRef.current = true;
+              selectConversation(urlTarget, true);
+            } else if (sorted.length > 0 && !urlTarget) {
+              hasInitialSelectedRef.current = true;
+              selectConversation(sorted[0].id, true);
+            }
           }
 
           return sorted;
@@ -1055,6 +1124,7 @@ export default function App() {
     }
 
     setActiveSessionId(null);
+    updateUrlForSession(null);
     turnStartStepRef.current = 0;
     totalStepsRef.current = 0;
     setIsGenerating(false);
@@ -1269,9 +1339,12 @@ export default function App() {
     });
   };
 
-  const selectConversation = async (id) => {
-    if (id === activeSessionId) return;
+  const selectConversation = async (id, updateUrl = true) => {
+    if (id === activeSessionId && !isLoadingChat) return;
     setActiveSessionId(id);
+    if (updateUrl) {
+      updateUrlForSession(id);
+    }
     isGeneratingRef.current = false;
     setIsGenerating(false);
     turnStartStepRef.current = 0;
@@ -1299,6 +1372,7 @@ export default function App() {
       setConversations(prev => prev.filter(c => c.id !== sessionId));
       if (activeSessionId === sessionId) {
         setActiveSessionId(null);
+        updateUrlForSession(null);
         setMessages([]);
         if (streamControllerRef.current) {
           streamControllerRef.current.abort();
@@ -1410,6 +1484,7 @@ export default function App() {
       try {
         targetSessionId = await client.startConversation(modelToUse, workspaceDir, selectedProjectId);
         setActiveSessionId(targetSessionId);
+        updateUrlForSession(targetSessionId);
         saveSessionWorkspace(targetSessionId, workspaceDir, selectedProjectId);
         const projObj = projects.find(p => p.id === selectedProjectId);
         const projName = projObj?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace';
