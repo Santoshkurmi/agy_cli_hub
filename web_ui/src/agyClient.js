@@ -158,31 +158,28 @@ export class AntigravityBrowserClient {
     return models;
   }
 
-  // 5. List all Conversations
-  async listConversations() {
+  // 5. Live Subscription to Conversation Summaries via JetboxSubscribeToSummaries
+  async subscribeToSummaries(onUpdate, abortSignal) {
     if (!this.csrfToken) await this.initCsrfToken();
-    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories`, {
-      method: 'POST',
-      headers: this.getHeaders(),
-      body: this.encodeFrame({ exclude_subtrajectories: true })
-    });
-    this.checkResponse(res);
+    try {
+      const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({}),
+        signal: abortSignal
+      });
+      this.checkResponse(res);
 
-    const list = [];
-    await this.parseStream(res.body, (json) => {
-      const summaries = json.trajectorySummaries || {};
-      for (const [id, summary] of Object.entries(summaries)) {
-        if (summary.lastModifiedTime && (summary.summary || (summary.stepCount && summary.stepCount > 0))) {
-          list.push({
-            id,
-            title: summary.summary || 'Untitled Conversation',
-            lastModified: summary.lastModifiedTime,
-            stepCount: summary.stepCount || 0
-          });
+      await this.parseStream(res.body, (json) => {
+        if (json.updates) {
+          onUpdate(json.updates);
         }
+      });
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.warn('[JetboxSubscribeToSummaries] stream error:', err);
       }
-    });
-    return list.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
+    }
   }
 
   // 6. List Registered Projects

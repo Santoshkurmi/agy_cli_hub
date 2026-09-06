@@ -17,6 +17,7 @@ import {
   Code,
   Folder,
   FolderGit2,
+  GitBranch,
   Check,
   X,
   Lock,
@@ -93,21 +94,115 @@ export default function App() {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
+  const [isLoadingChat, setIsLoadingChat] = useState(false);
+  const messagesContainerRef = useRef(null);
+  const shouldInstantScrollRef = useRef(false);
+
   const messagesEndRef = useRef(null);
   const abortControllerRef = useRef(null);  // for stop button (CancelCascadeInvocation)
   const streamControllerRef = useRef(null); // for the one persistent stream per session
+  const summariesControllerRef = useRef(null); // for JetboxSubscribeToSummaries
   const turnStartStepRef = useRef(0);        // updated before each sendMessage
   const totalStepsRef = useRef(0);           // tracked from StreamAgentStateUpdates
   const isGeneratingRef = useRef(false);
-  const newSessionsNeedingTitleRef = useRef(new Set());
+  const activeSessionIdRef = useRef(activeSessionId);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  const [expandedProjects, setExpandedProjects] = useState({});
+  const toggleProjectExpand = (projId) => {
+    setExpandedProjects(prev => ({ ...prev, [projId]: !prev[projId] }));
+  };
+
+  const getProjectDisplayName = (projId, wsDir) => {
+    const p = projects.find(proj => proj.id === projId || proj.path === wsDir);
+    if (p?.name) return p.name;
+    if (wsDir) {
+      const folder = wsDir.replace(/\/+$/, '').split('/').pop();
+      if (folder) return folder;
+    }
+    if (projId && projId !== 'default-cli-project') return projId;
+    return 'Main Workspace';
+  };
+
+  const formatTimeAgo = (dateStr) => {
+    if (!dateStr) return '';
+    try {
+      const d = new Date(dateStr);
+      const now = new Date();
+      const diffSec = Math.floor((now - d) / 1000);
+      if (diffSec < 60) return 'Just now';
+      if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+      if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+      if (diffSec < 172800) return 'Yesterday';
+      return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    } catch {
+      return '';
+    }
+  };
+
+  const groupedConversations = React.useMemo(() => {
+    const groups = {};
+    conversations.forEach(chat => {
+      const projKey = chat.projectId || 'default-cli-project';
+      const projName = getProjectDisplayName(projKey, chat.workspaceDir);
+
+      if (!groups[projKey]) {
+        groups[projKey] = {
+          id: projKey,
+          name: projName,
+          workspaceDir: chat.workspaceDir,
+          chats: [],
+          latestUpdate: chat.lastModified || '1970-01-01'
+        };
+      }
+      groups[projKey].chats.push(chat);
+      if (new Date(chat.lastModified) > new Date(groups[projKey].latestUpdate)) {
+        groups[projKey].latestUpdate = chat.lastModified;
+      }
+    });
+
+    // Sort chats within each project: latest updated first
+    Object.values(groups).forEach(g => {
+      g.chats.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
+    });
+
+    // Sort project groups by latest activity
+    return Object.values(groups).sort((a, b) => new Date(b.latestUpdate) - new Date(a.latestUpdate));
+  }, [conversations, projects]);
+
+  const scrollToBottom = (instant = false) => {
+    if (instant || shouldInstantScrollRef.current) {
+      if (messagesContainerRef.current) {
+        messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+      }
+      messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+    } else {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
   };
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+    if (isLoadingChat) return;
+
+    if (shouldInstantScrollRef.current) {
+      const jump = () => {
+        if (messagesContainerRef.current) {
+          messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight;
+        }
+        messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+      };
+      jump();
+      requestAnimationFrame(jump);
+      const timer = setTimeout(jump, 50);
+      shouldInstantScrollRef.current = false;
+      return () => clearTimeout(timer);
+    } else {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [messages, isLoadingChat]);
 
   const hasInitializedRef = useRef(false);
 
@@ -147,18 +242,57 @@ export default function App() {
         console.warn('Failed to load projects:', err);
       }
 
-      // 3. Fetch conversations list
-      console.log('[UI] Fetching conversations list...');
-      const convList = await client.listConversations();
-      setConversations(convList);
-      convList.forEach(c => {
-        if (c.stepCount === 0 || (c.title && c.title.startsWith('Session ('))) {
-          newSessionsNeedingTitleRef.current.add(c.id);
-        }
-      });
-      if (convList.length > 0 && !activeSessionId) {
-        selectConversation(convList[0].id);
+      // 3. Live Subscription to conversation summaries via JetboxSubscribeToSummaries
+      console.log('[UI] Subscribing to live conversation summaries...');
+      if (summariesControllerRef.current) {
+        summariesControllerRef.current.abort();
       }
+      const summariesCtrl = new AbortController();
+      summariesControllerRef.current = summariesCtrl;
+
+      client.subscribeToSummaries((incomingUpdates) => {
+        setConversations(prev => {
+          const map = new Map(prev.map(c => [c.id, c]));
+          const saved = getSavedWorkspaces();
+
+          for (const [id, item] of Object.entries(incomingUpdates)) {
+            // Ignore empty abandoned sessions with no steps, no title, and no summary (unless currently active)
+            const hasContent = Boolean(item.annotations?.title || item.summary || (item.stepCount && item.stepCount > 0));
+            if (!hasContent && id !== activeSessionIdRef.current) {
+              map.delete(id);
+              continue;
+            }
+
+            const existing = map.get(id);
+            const workspaceUri = item.trajectoryMetadata?.workspaceUris?.[0] || item.workspaces?.[0]?.workspaceFolderAbsoluteUri || '';
+            const wsDir = workspaceUri ? workspaceUri.replace(/^file:\/\//, '') : (existing?.workspaceDir || saved[id]?.workspaceDir || '/home/cat/agy_cli_hub');
+            const projId = item.trajectoryMetadata?.projectId || existing?.projectId || saved[id]?.projectId || 'default-cli-project';
+            const branch = item.workspaces?.[0]?.branchName || existing?.branchName || '';
+
+            map.set(id, {
+              ...existing,
+              id,
+              title: item.annotations?.title || item.summary || existing?.title || 'New Session',
+              lastModified: item.lastModifiedTime || existing?.lastModified || new Date().toISOString(),
+              stepCount: item.stepCount !== undefined ? item.stepCount : (existing?.stepCount || 0),
+              status: item.status || existing?.status || 'CASCADE_RUN_STATUS_IDLE',
+              projectId: projId,
+              workspaceDir: wsDir,
+              branchName: branch,
+              lastUserInputTime: item.lastUserInputTime,
+              createdTime: item.createdTime
+            });
+          }
+
+          const sorted = Array.from(map.values()).sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
+
+          if (!activeSessionIdRef.current && sorted.length > 0) {
+            selectConversation(sorted[0].id);
+          }
+
+          return sorted;
+        });
+      }, summariesCtrl.signal);
     } catch (err) {
       console.warn('[UI] Connect check failed:', err.message);
       setConnected(false);
@@ -186,7 +320,6 @@ export default function App() {
     try {
       const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
       const cascadeId = await client.startConversation(modelToUse, finalPath, finalProjId);
-      newSessionsNeedingTitleRef.current.add(cascadeId);
       saveSessionWorkspace(cascadeId, finalPath, finalProjId);
       const newChat = {
         id: cascadeId,
@@ -235,6 +368,7 @@ export default function App() {
           if (update.messages && update.messages.length > 0) {
             setMessages(update.messages);
           }
+          setIsLoadingChat(false);
           if (update.isRunning) {
             setIsGenerating(true);
             isGeneratingRef.current = true;
@@ -255,27 +389,8 @@ export default function App() {
         }
 
         if (update.type === 'done') {
-          const wasGenerating = isGeneratingRef.current;
           isGeneratingRef.current = false;
           setIsGenerating(false);
-
-          // Only fetch conversation list once: after the first response of a NEW chat,
-          // so its sidebar title updates from the placeholder to the model-generated title.
-          // Never call it when switching chats or on subsequent messages in existing chats.
-          if (wasGenerating && newSessionsNeedingTitleRef.current.has(sessionId)) {
-            newSessionsNeedingTitleRef.current.delete(sessionId);
-            client.listConversations().then(remoteList => {
-              const saved = getSavedWorkspaces();
-              setConversations(prev => remoteList.map(remote => {
-                const existing = prev.find(p => p.id === remote.id);
-                return {
-                  ...remote,
-                  workspaceDir: existing?.workspaceDir || saved[remote.id]?.workspaceDir || '/home/cat/agy_cli_hub',
-                  projectId: existing?.projectId || saved[remote.id]?.projectId || 'default-cli-project'
-                };
-              }));
-            });
-          }
           return;
         }
 
@@ -391,6 +506,8 @@ export default function App() {
     setIsGenerating(false);
     turnStartStepRef.current = 0;
     totalStepsRef.current = 0;
+    setIsLoadingChat(true);
+    shouldInstantScrollRef.current = true;
 
     const targetConv = conversations.find(c => c.id === id);
     const saved = getSavedWorkspaces();
@@ -574,19 +691,90 @@ export default function App() {
         </div>
 
         <div className="chat-list">
-          {conversations.map(chat => (
-            <div
-              key={chat.id}
-              className={`chat-item ${chat.id === activeSessionId ? 'active' : ''}`}
-              onClick={() => selectConversation(chat.id)}
-            >
-              <div className="chat-item-title">{chat.title}</div>
-              <div className="chat-item-meta">
-                <span>{chat.stepCount} steps</span>
-                <span>{new Date(chat.lastModified).toLocaleDateString([], { month: 'short', day: 'numeric' })}</span>
+          {groupedConversations.map(group => {
+            const hasMore = group.chats.length > 5;
+            const isExpanded = Boolean(expandedProjects[group.id]);
+            const displayedChats = isExpanded ? group.chats : group.chats.slice(0, 5);
+
+            return (
+              <div className="project-group" key={group.id}>
+                <div
+                  className="project-group-header"
+                  onClick={() => hasMore && toggleProjectExpand(group.id)}
+                  style={{ cursor: hasMore ? 'pointer' : 'default' }}
+                  title={hasMore ? (isExpanded ? 'Collapse back to 5 chats' : `Show all ${group.chats.length} chats`) : undefined}
+                >
+                  <div className="project-group-title">
+                    <Folder size={13} className="project-icon" />
+                    <span className="project-name">{group.name}</span>
+                    <span className="project-count">{group.chats.length}</span>
+                  </div>
+                  {hasMore && (
+                    <div className="project-toggle-icon">
+                      {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                    </div>
+                  )}
+                </div>
+
+                <div className="project-chats-list">
+                  {displayedChats.map(chat => {
+                    const isRunning = chat.status === 'CASCADE_RUN_STATUS_RUNNING';
+                    const isActive = chat.id === activeSessionId;
+                    return (
+                      <div
+                        key={chat.id}
+                        className={`chat-item ${isActive ? 'active' : ''} ${isRunning ? 'running' : ''}`}
+                        onClick={() => selectConversation(chat.id)}
+                      >
+                        <div className="chat-item-header">
+                          <div className="chat-item-title" title={chat.title}>{chat.title}</div>
+                          {isRunning && (
+                            <span className="live-badge" title="Agent is working...">
+                              <span className="live-dot-pulse"></span>
+                              Running
+                            </span>
+                          )}
+                        </div>
+                        <div className="chat-item-meta">
+                          <span className="meta-steps">
+                            {chat.stepCount || 0} {chat.stepCount === 1 ? 'step' : 'steps'}
+                          </span>
+                          {chat.branchName && (
+                            <span className="meta-branch" title={`Branch: ${chat.branchName}`}>
+                              <GitBranch size={10} style={{ display: 'inline', marginRight: 2, verticalAlign: 'middle' }} />
+                              {chat.branchName}
+                            </span>
+                          )}
+                          <span className="meta-time">{formatTimeAgo(chat.lastModified)}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  {hasMore && (
+                    <button
+                      className="btn-show-more-chats"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleProjectExpand(group.id);
+                      }}
+                    >
+                      {isExpanded ? (
+                        <>
+                          <ChevronUp size={12} /> Show less (top 5)
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown size={12} /> See all ({group.chats.length - 5} more)
+                        </>
+                      )}
+                    </button>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
+
           {conversations.length === 0 && (
             <div style={{ padding: '20px', color: '#64748b', fontSize: '12px', textAlign: 'center' }}>
               No sessions found. Start a new session!
@@ -733,8 +921,14 @@ export default function App() {
         )}
 
         {/* Chat Messages */}
-        <div className="messages-container">
-          {messages.map((msg, idx) => (
+        <div className="messages-container" ref={messagesContainerRef}>
+          {isLoadingChat ? (
+            <div className="chat-loading-state">
+              <Loader2 size={26} className="spin-loader" />
+              <span>Loading conversation history...</span>
+            </div>
+          ) : (
+            messages.map((msg, idx) => (
             <div key={idx} className="message-row">
               {msg.role === 'system' ? (
                 <div className="message-system">
@@ -999,7 +1193,7 @@ export default function App() {
                 </div>
               )}
             </div>
-          ))}
+          )))}
           <div ref={messagesEndRef} />
         </div>
 
