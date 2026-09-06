@@ -31,7 +31,12 @@ import {
   Activity,
   Copy,
   Clock,
-  Ban
+  Ban,
+  GitFork,
+  RotateCcw,
+  Mic,
+  MicOff,
+  Trash2
 } from 'lucide-react';
 import { AntigravityBrowserClient } from './agyClient';
 
@@ -115,6 +120,39 @@ export default function App() {
   const [quotaSummary, setQuotaSummary] = useState(null);
   const [showQuotaModal, setShowQuotaModal] = useState(false);
   const [isRefreshingQuota, setIsRefreshingQuota] = useState(false);
+
+  // Sidebar Search States
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [deletingSessionId, setDeletingSessionId] = useState(null);
+
+  // Slash Command Autocomplete States (Lazy-cached on first '/')
+  const [cachedSlashCommands, setCachedSlashCommands] = useState(() => {
+    try {
+      const stored = localStorage.getItem('agy_slash_commands_cache');
+      return stored ? JSON.parse(stored) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [slashMenuOpen, setSlashMenuOpen] = useState(false);
+  const [slashSelectedIndex, setSlashSelectedIndex] = useState(0);
+
+  // Voice Recording & Audio Note States
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [attachedAudio, setAttachedAudio] = useState(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const recordingTimerRef = useRef(null);
+  const audioStreamRef = useRef(null);
+  const recordingStartTimeRef = useRef(0);
+  const recognitionRef = useRef(null);
+
+  // Git VCS State
+  const [vcsState, setVcsState] = useState(null);
+  const vcsAbortCtrlRef = useRef(null);
 
   const [messages, setMessages] = useState([]);
   const [inputPrompt, setInputPrompt] = useState('');
@@ -273,6 +311,365 @@ export default function App() {
     return () => clearInterval(timer);
   }, [fetchQuotaSummary]);
 
+  // 1. Debounced Conversation Search
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSearchResults([]);
+      setIsSearching(false);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        setIsSearching(true);
+        const results = await client.searchConversations(searchQuery);
+        setSearchResults(results);
+      } catch (err) {
+        console.warn('[Search] Failed:', err);
+      } finally {
+        setIsSearching(false);
+      }
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  // 2. Live Git VCS State Watcher
+  useEffect(() => {
+    if (vcsAbortCtrlRef.current) {
+      vcsAbortCtrlRef.current.abort();
+    }
+    const ctrl = new AbortController();
+    vcsAbortCtrlRef.current = ctrl;
+
+    client.watchVersionControlState(workspaceDir, (state) => {
+      setVcsState(state);
+    }, ctrl.signal);
+
+    return () => {
+      ctrl.abort();
+    };
+  }, [workspaceDir]);
+
+  // 3. Lazy-fetch slash commands (cached once on typing '/')
+  const fetchSlashCommandsIfNeeded = useCallback(async () => {
+    if (cachedSlashCommands && cachedSlashCommands.length > 0) return cachedSlashCommands;
+    try {
+      const cmds = await client.getSlashCommands(selectedModel);
+      if (cmds && cmds.length > 0) {
+        const formatted = cmds.map(c => ({
+          name: c.info?.name,
+          description: c.info?.description || c.info?.modelFacingText?.slice(0, 100) || '',
+          type: c.info?.type || 'command'
+        }));
+        setCachedSlashCommands(formatted);
+        try {
+          localStorage.setItem('agy_slash_commands_cache', JSON.stringify(formatted));
+        } catch {}
+        return formatted;
+      }
+    } catch (err) {
+      console.warn('[Slash Commands] Failed to fetch:', err);
+    }
+    return [];
+  }, [cachedSlashCommands, selectedModel]);
+
+  // 4. Fork Active Conversation into a New Branch
+  const handleForkSession = async () => {
+    if (!activeSessionId) return;
+    try {
+      showToast('Forking conversation...', 'info');
+      const newCascadeId = await client.forkConversation(activeSessionId);
+      if (newCascadeId) {
+        saveSessionWorkspace(newCascadeId, workspaceDir, selectedProjectId);
+        const currentConv = conversations.find(c => c.id === activeSessionId);
+        const newTitle = currentConv ? `[Fork] ${currentConv.title}` : 'Forked Session';
+
+        setConversations(prev => [{
+          id: newCascadeId,
+          title: newTitle,
+          lastModified: new Date().toISOString(),
+          stepCount: totalStepsRef.current || 1,
+          workspaceDir,
+          projectId: selectedProjectId
+        }, ...prev]);
+
+        selectConversation(newCascadeId);
+        showToast('Conversation branched into a new session!', 'success');
+      }
+    } catch (err) {
+      console.error('Failed to fork session:', err);
+      showToast(`Fork failed: ${err.message}`, 'error');
+    }
+  };
+
+  // 5. Revert Conversation Back to Specific Step
+  const handleRevertTurn = async (targetStepIndex) => {
+    if (!activeSessionId || targetStepIndex === undefined) return;
+    const confirm = window.confirm(`Revert conversation back to step #${targetStepIndex}? Future actions from this turn onward will be undone.`);
+    if (!confirm) return;
+
+    try {
+      showToast(`Reverting to step #${targetStepIndex}...`, 'info');
+      await client.revertToCascadeStep(activeSessionId, targetStepIndex);
+
+      turnStartStepRef.current = targetStepIndex;
+      totalStepsRef.current = targetStepIndex;
+
+      // Reconnect persistent stream to load the reverted state
+      startPersistentStream(activeSessionId);
+      showToast(`Successfully reverted to step #${targetStepIndex}`, 'success');
+    } catch (err) {
+      console.error('Failed to revert:', err);
+      showToast(`Revert failed: ${err.message}`, 'error');
+    }
+  };
+
+  // 6. Voice Audio Recording (MediaRecorder + Speech API)
+  const startAudioRecording = async () => {
+    try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        showToast('Microphone access is not supported in this browser.', 'error');
+        return;
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioStreamRef.current = stream;
+
+      let mimeType = 'audio/webm;codecs=opus';
+      if (!window.MediaRecorder || !MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/webm';
+      if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'audio/ogg';
+      if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = '';
+
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      audioChunksRef.current = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      // Also start speech recognition if supported to get instant live text preview
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        try {
+          const rec = new SpeechRecognition();
+          rec.continuous = true;
+          rec.interimResults = true;
+          rec.lang = 'en-US';
+          rec.onresult = (ev) => {
+            let tr = '';
+            for (let i = 0; i < ev.results.length; i++) {
+              tr += ev.results[i][0].transcript;
+            }
+            if (tr) setInputPrompt(tr);
+          };
+          rec.onerror = () => {};
+          rec.start();
+          recognitionRef.current = rec;
+        } catch {}
+      }
+
+      recordingStartTimeRef.current = Date.now();
+      setRecordingTime(0);
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = setInterval(() => {
+        const secs = Math.floor((Date.now() - recordingStartTimeRef.current) / 1000);
+        setRecordingTime(secs);
+      }, 500);
+
+      recorder.onstop = () => {
+        if (recordingTimerRef.current) {
+          clearInterval(recordingTimerRef.current);
+          recordingTimerRef.current = null;
+        }
+        if (recognitionRef.current) {
+          try { recognitionRef.current.stop(); } catch {}
+          recognitionRef.current = null;
+        }
+
+        const dur = Math.max(1, Math.floor((Date.now() - recordingStartTimeRef.current) / 1000));
+        const mins = Math.floor(dur / 60);
+        const secs = (dur % 60).toString().padStart(2, '0');
+        const formatted = `${mins}:${secs}`;
+
+        const recordedBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+        const audioUrl = URL.createObjectURL(recordedBlob);
+
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const base64Data = (reader.result || '').split(',')[1] || '';
+          const audioObj = {
+            blob: recordedBlob,
+            url: audioUrl,
+            base64: base64Data,
+            duration: dur,
+            durationFormatted: formatted,
+            mimeType: recordedBlob.type || 'audio/webm',
+            transcription: inputPrompt.trim()
+          };
+          setAttachedAudio(audioObj);
+
+          // Ask backend daemon for transcription if inputPrompt is empty
+          if (!inputPrompt.trim() && base64Data) {
+            client.getTranscription(base64Data).then(transcribed => {
+              if (transcribed) {
+                setAttachedAudio(prev => prev ? { ...prev, transcription: transcribed } : null);
+                setInputPrompt(transcribed);
+              }
+            }).catch(() => {});
+          }
+        };
+        reader.readAsDataURL(recordedBlob);
+
+        if (audioStreamRef.current) {
+          audioStreamRef.current.getTracks().forEach(t => t.stop());
+          audioStreamRef.current = null;
+        }
+      };
+
+      recorder.start(100);
+      setIsRecording(true);
+      showToast('Recording voice note. Speak into microphone.', 'info');
+    } catch (err) {
+      console.error('Failed to access microphone:', err);
+      showToast(`Microphone error: ${err.message}`, 'error');
+      setIsRecording(false);
+    }
+  };
+
+  const stopAudioRecording = () => {
+    setIsRecording(false);
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (err) {
+        console.warn('Error stopping MediaRecorder:', err);
+      }
+    }
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch {}
+    }
+    showToast('Voice note recorded & attached. Click Send to submit.', 'success');
+  };
+
+  const cancelAudioRecording = () => {
+    setIsRecording(false);
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        mediaRecorderRef.current.onstop = null;
+        mediaRecorderRef.current.stop();
+      } catch {}
+    }
+    if (audioStreamRef.current) {
+      audioStreamRef.current.getTracks().forEach(t => t.stop());
+      audioStreamRef.current = null;
+    }
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch {}
+    }
+    audioChunksRef.current = [];
+    showToast('Voice recording canceled.', 'info');
+  };
+
+  const toggleRecording = () => {
+    if (isRecording) {
+      stopAudioRecording();
+    } else {
+      startAudioRecording();
+    }
+  };
+
+  const handleVoiceSend = (e) => {
+    e?.preventDefault();
+    if (isRecording) {
+      stopAudioRecording();
+      setTimeout(() => {
+        handleSendMessage(e);
+      }, 150);
+      return;
+    }
+    handleSendMessage(e);
+  };
+
+  // Slash Command Input Handlers
+  const handlePromptChange = async (e) => {
+    const val = e.target.value;
+    setInputPrompt(val);
+
+    // If starts with '/' or has a trailing space and '/', open autocomplete
+    const match = val.match(/(?:^|\s)\/([a-zA-Z0-9_-]*)$/);
+    if (match) {
+      setSlashMenuOpen(true);
+      setSlashSelectedIndex(0);
+      if (!cachedSlashCommands) {
+        await fetchSlashCommandsIfNeeded();
+      }
+    } else {
+      setSlashMenuOpen(false);
+    }
+  };
+
+  const filteredSlashCommands = useMemo(() => {
+    if (!cachedSlashCommands) return [];
+    const match = inputPrompt.match(/(?:^|\s)\/([a-zA-Z0-9_-]*)$/);
+    if (!match) return cachedSlashCommands;
+    const filterTerm = match[1].toLowerCase();
+    if (!filterTerm) return cachedSlashCommands;
+    return cachedSlashCommands.filter(c =>
+      c.name.toLowerCase().includes(filterTerm) || c.description.toLowerCase().includes(filterTerm)
+    );
+  }, [cachedSlashCommands, inputPrompt]);
+
+  const applySlashCommand = (cmdName) => {
+    setInputPrompt(prev => {
+      const replaced = prev.replace(/(?:^|\s)\/([a-zA-Z0-9_-]*)$/, ` /${cmdName} `);
+      return replaced.trimStart();
+    });
+    setSlashMenuOpen(false);
+  };
+
+  const handlePromptKeyDown = (e) => {
+    if (slashMenuOpen && filteredSlashCommands.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSlashSelectedIndex(prev => (prev + 1) % filteredSlashCommands.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSlashSelectedIndex(prev => (prev - 1 + filteredSlashCommands.length) % filteredSlashCommands.length);
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        const picked = filteredSlashCommands[slashSelectedIndex];
+        if (picked) {
+          applySlashCommand(picked.name);
+        }
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setSlashMenuOpen(false);
+        return;
+      }
+    }
+
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSendMessage(e);
+    }
+  };
+
   // Close modals on Escape key
   useEffect(() => {
     const handleKeyDown = (e) => {
@@ -280,6 +677,7 @@ export default function App() {
         setShowQuotaModal(false);
         setShowTasksModal(false);
         setShowProjectModal(false);
+        setSlashMenuOpen(false);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -612,6 +1010,30 @@ export default function App() {
     startPersistentStream(id);
   };
 
+  const handleDeleteConversation = async (sessionId, e) => {
+    e?.stopPropagation();
+    if (!window.confirm('Are you sure you want to delete this session?')) return;
+    setDeletingSessionId(sessionId);
+    try {
+      await client.deleteCascadeTrajectory(sessionId);
+      setConversations(prev => prev.filter(c => c.id !== sessionId));
+      if (activeSessionId === sessionId) {
+        setActiveSessionId(null);
+        setMessages([]);
+        if (streamControllerRef.current) {
+          streamControllerRef.current.abort();
+          streamControllerRef.current = null;
+        }
+      }
+      showToast('Session deleted successfully', 'success');
+    } catch (err) {
+      console.error('Failed to delete session:', err);
+      showToast(`Failed to delete session: ${err.message}`, 'error');
+    } finally {
+      setDeletingSessionId(null);
+    }
+  };
+
   const handleApproveCommand = async (stepIndex, scope = 'PERMISSION_SCOPE_ONCE') => {
     if (!activeSessionId) return;
     try {
@@ -666,7 +1088,20 @@ export default function App() {
 
   const handleSendMessage = async (e) => {
     e?.preventDefault();
-    if (!inputPrompt.trim() || isGenerating) return;
+
+    let currentAudio = attachedAudio;
+
+    // If recording voice, stop audio recorder
+    if (isRecording) {
+      stopAudioRecording();
+    }
+
+    const currentPrompt = inputPrompt;
+
+    if ((!currentPrompt.trim() && !currentAudio) || isGenerating) return;
+
+    setInputPrompt('');
+    setAttachedAudio(null);
 
     const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
 
@@ -678,9 +1113,10 @@ export default function App() {
         saveSessionWorkspace(targetSessionId, workspaceDir, selectedProjectId);
         const projObj = projects.find(p => p.id === selectedProjectId);
         const projName = projObj?.name || workspaceDir.split('/').filter(Boolean).pop() || 'Workspace';
+        const sessionTitle = currentPrompt.slice(0, 30) || (currentAudio ? `Voice Note (${currentAudio.durationFormatted})` : 'New Session');
         setConversations(prev => [{
           id: targetSessionId,
-          title: inputPrompt.slice(0, 30),
+          title: sessionTitle,
           lastModified: new Date().toISOString(),
           stepCount: 1,
           workspaceDir,
@@ -695,30 +1131,44 @@ export default function App() {
       }
     }
 
-    const currentPrompt = inputPrompt;
-    setInputPrompt('');
+    // Check if user requested planning mode via /plan slash command
+    const isPlan = currentPrompt.trim().startsWith('/plan');
+    const actualText = isPlan
+      ? currentPrompt.trim().replace(/^\/plan\s*/i, '') || 'Create a comprehensive implementation plan'
+      : currentPrompt;
 
     // 1. Snapshot current step count as the turn boundary for this message.
-    //    Tracked directly from StreamAgentStateUpdates — zero extra network requests!
     turnStartStepRef.current = totalStepsRef.current;
 
     // 2. Append user message & placeholder assistant turn
     setMessages(prev => [
       ...prev.filter(m => m.role !== 'system'),
-      { role: 'user', content: currentPrompt },
+      {
+        role: 'user',
+        content: currentPrompt,
+        audio: currentAudio
+      },
       { role: 'assistant', steps: [] }
     ]);
     isGeneratingRef.current = true;
     setIsGenerating(true);
 
     try {
-      // 3. Send the message — the persistent stream already open will receive updates
+      const mediaPayload = currentAudio ? [{
+        mimeType: currentAudio.mimeType || 'audio/webm',
+        inlineData: currentAudio.base64,
+        durationSeconds: currentAudio.duration || 0,
+        description: currentAudio.transcription || 'Voice note'
+      }] : [];
+
       await client.sendMessage({
         cascadeId: targetSessionId,
-        text: currentPrompt,
+        text: actualText || (currentAudio?.transcription ? `Voice message: "${currentAudio.transcription}"` : 'Voice message'),
         modelEnum: modelToUse,
         thinkingBudget: parseInt(thinkingBudget, 10),
-        autoExecutionPolicy
+        autoExecutionPolicy,
+        media: mediaPayload,
+        ...(isPlan ? { planningMode: 'PLANNING_MODE_ON' } : {})
       });
     } catch (err) {
       console.error('Chat send error:', err);
@@ -941,97 +1391,154 @@ export default function App() {
           </button>
         </div>
 
-        <div className="chat-list">
-          {groupedConversations.map(group => {
-            const hasMore = group.chats.length > 5;
-            const isExpanded = Boolean(expandedProjects[group.id]);
-            const displayedChats = isExpanded ? group.chats : group.chats.slice(0, 5);
-
-            return (
-              <div className="project-group" key={group.id}>
-                <div
-                  className="project-group-header"
-                  onClick={() => hasMore && toggleProjectExpand(group.id)}
-                  style={{ cursor: hasMore ? 'pointer' : 'default' }}
-                  title={hasMore ? (isExpanded ? 'Collapse back to 5 chats' : `Show all ${group.chats.length} chats`) : undefined}
-                >
-                  <div className="project-group-title">
-                    <Folder size={13} className="project-icon" />
-                    <span className="project-name">{group.name}</span>
-                    <span className="project-count">{group.chats.length}</span>
-                  </div>
-                  {hasMore && (
-                    <div className="project-toggle-icon">
-                      {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-                    </div>
-                  )}
-                </div>
-
-                <div className="project-chats-list">
-                  {displayedChats.map(chat => {
-                    const isRunning = chat.status === 'CASCADE_RUN_STATUS_RUNNING';
-                    const isActive = chat.id === activeSessionId;
-                    return (
-                      <div
-                        key={chat.id}
-                        className={`chat-item ${isActive ? 'active' : ''} ${isRunning ? 'running' : ''}`}
-                        onClick={() => selectConversation(chat.id)}
-                      >
-                        <div className="chat-item-header">
-                          <div className="chat-item-title" title={chat.title}>{chat.title}</div>
-                          {isRunning && (
-                            <span className="live-badge" title="Agent is working...">
-                              <span className="live-dot-pulse"></span>
-                              Running
-                            </span>
-                          )}
-                        </div>
-                        <div className="chat-item-meta">
-                          <span className="meta-steps">
-                            {chat.stepCount || 0} {chat.stepCount === 1 ? 'step' : 'steps'}
-                          </span>
-                          {chat.branchName && (
-                            <span className="meta-branch" title={`Branch: ${chat.branchName}`}>
-                              <GitBranch size={10} style={{ display: 'inline', marginRight: 2, verticalAlign: 'middle' }} />
-                              {chat.branchName}
-                            </span>
-                          )}
-                          <span className="meta-time">{formatTimeAgo(chat.lastModified)}</span>
-                        </div>
-                      </div>
-                    );
-                  })}
-
-                  {hasMore && (
-                    <button
-                      className="btn-show-more-chats"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        toggleProjectExpand(group.id);
-                      }}
-                    >
-                      {isExpanded ? (
-                        <>
-                          <ChevronUp size={12} /> Show less (top 5)
-                        </>
-                      ) : (
-                        <>
-                          <ChevronDown size={12} /> See all ({group.chats.length - 5} more)
-                        </>
-                      )}
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-
-          {conversations.length === 0 && (
-            <div style={{ padding: '20px', color: '#64748b', fontSize: '12px', textAlign: 'center' }}>
-              No sessions found. Start a new session!
-            </div>
-          )}
+        {/* Sidebar Search Bar */}
+        <div className="sidebar-search-container">
+          <div className="sidebar-search-box">
+            <Search size={13} color="#64748b" />
+            <input
+              type="text"
+              className="sidebar-search-input"
+              placeholder="Search all conversations..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                style={{ background: 'transparent', border: 'none', color: '#64748b', cursor: 'pointer', display: 'flex', alignItems: 'center', padding: 0 }}
+                title="Clear Search"
+              >
+                <X size={13} />
+              </button>
+            )}
+          </div>
         </div>
+
+        {searchQuery.trim() ? (
+          <div className="sidebar-search-results">
+            {isSearching ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '16px', color: '#64748b', fontSize: '12px' }}>
+                <Loader2 size={14} className="spin" />
+                <span>Searching conversations...</span>
+              </div>
+            ) : searchResults.length === 0 ? (
+              <div style={{ padding: '20px 12px', color: '#64748b', fontSize: '12px', textAlign: 'center' }}>
+                No matching conversations found
+              </div>
+            ) : (
+              searchResults.map((res) => (
+                <div
+                  key={res.cascadeId}
+                  className={`search-result-item ${res.cascadeId === activeSessionId ? 'active' : ''}`}
+                  onClick={() => selectConversation(res.cascadeId)}
+                >
+                  <div className="search-result-title">{res.title || 'Untitled Session'}</div>
+                  {res.snippet && (
+                    <div className="search-result-snippet">{res.snippet}</div>
+                  )}
+                  <div className="search-result-meta">
+                    <span>{res.workspaceName || 'Workspace'}</span>
+                    <span>{res.lastModifiedTime ? new Date(res.lastModifiedTime).toLocaleDateString([], { month: 'short', day: 'numeric' }) : ''}</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        ) : (
+          <div className="chat-list">
+            {groupedConversations.map(group => {
+              const hasMore = group.chats.length > 5;
+              const isExpanded = Boolean(expandedProjects[group.id]);
+              const displayedChats = isExpanded ? group.chats : group.chats.slice(0, 5);
+
+              return (
+                <div className="project-group" key={group.id}>
+                  <div
+                    className="project-group-header"
+                    onClick={() => hasMore && toggleProjectExpand(group.id)}
+                    style={{ cursor: hasMore ? 'pointer' : 'default' }}
+                    title={hasMore ? (isExpanded ? 'Collapse back to 5 chats' : `Show all ${group.chats.length} chats`) : undefined}
+                  >
+                    <div className="project-group-title">
+                      <Folder size={13} className="project-icon" />
+                      <span className="project-name">{group.name}</span>
+                      <span className="project-count">{group.chats.length}</span>
+                    </div>
+                    {hasMore && (
+                      <div className="project-toggle-icon">
+                        {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="project-chats-list">
+                    {displayedChats.map(chat => {
+                      const isRunning = chat.status === 'CASCADE_RUN_STATUS_RUNNING';
+                      const isActive = chat.id === activeSessionId;
+                      return (
+                        <div
+                          key={chat.id}
+                          className={`chat-item ${isActive ? 'active' : ''} ${isRunning ? 'running' : ''}`}
+                          onClick={() => selectConversation(chat.id)}
+                        >
+                          <div className="chat-item-header">
+                            <div className="chat-item-title" title={chat.title}>{chat.title}</div>
+                            {isRunning && (
+                              <span className="live-badge" title="Agent is working...">
+                                <span className="live-dot-pulse"></span>
+                                Running
+                              </span>
+                            )}
+                          </div>
+                          <div className="chat-item-meta">
+                            <span>{chat.stepCount} steps</span>
+                            <span>{new Date(chat.lastModified).toLocaleDateString([], { month: 'short', day: 'numeric' })}</span>
+                          </div>
+                          <button
+                            type="button"
+                            className={`btn-delete-chat ${deletingSessionId === chat.id ? 'deleting' : ''}`}
+                            title="Delete session"
+                            onClick={(e) => handleDeleteConversation(chat.id, e)}
+                          >
+                            {deletingSessionId === chat.id ? (
+                              <Loader2 size={13} className="spin" />
+                            ) : (
+                              <Trash2 size={13} />
+                            )}
+                          </button>
+                        </div>
+                      );
+                    })}
+                    {hasMore && (
+                      <button
+                        type="button"
+                        className="btn-show-more-chats"
+                        onClick={() => toggleProjectExpand(group.id)}
+                      >
+                        {isExpanded ? (
+                          <>
+                            <ChevronUp size={12} /> Show Less
+                          </>
+                        ) : (
+                          <>
+                            <ChevronDown size={12} /> Show All ({group.chats.length})
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+
+            {conversations.length === 0 && (
+              <div style={{ padding: '20px', color: '#64748b', fontSize: '12px', textAlign: 'center' }}>
+                No sessions found. Start a new session!
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Main Area */}
@@ -1095,6 +1602,36 @@ export default function App() {
                   </>
                 )}
               </button>
+            )}
+
+            {/* Fork Conversation Branch Button */}
+            {activeSessionId && (
+              <button
+                type="button"
+                className="btn-fork-session"
+                onClick={handleForkSession}
+                title="Branch / Clone this conversation into a new session (/fork)"
+              >
+                <GitFork size={13} />
+                <span>Fork</span>
+              </button>
+            )}
+
+            {/* Live Git VCS Indicator */}
+            {vcsState && (
+              <div
+                className="git-vcs-badge"
+                title={`Git Branch: ${vcsState.currentRef || 'main'} | Upstream: ${vcsState.upstreamBranch || 'None'}`}
+              >
+                <GitBranch size={13} color="#34d399" />
+                <span className="git-vcs-branch">{vcsState.currentRef || 'main'}</span>
+                {(vcsState.commitsAhead > 0 || vcsState.commitsBehind > 0) && (
+                  <span className="git-vcs-sync">
+                    {vcsState.commitsAhead > 0 ? `↑${vcsState.commitsAhead}` : ''}
+                    {vcsState.commitsBehind > 0 ? `↓${vcsState.commitsBehind}` : ''}
+                  </span>
+                )}
+              </div>
             )}
 
             {/* Clickable Quota Badge (5h / 7d dual indicators) */}
@@ -1242,7 +1779,30 @@ export default function App() {
                   <span>{msg.content}</span>
                 </div>
               ) : msg.role === 'user' ? (
-                <div className="message-user">{msg.content}</div>
+                <div className="message-user" style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '10px' }}>
+                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {msg.content && <span>{msg.content}</span>}
+                    {msg.audio && (
+                      <div className="message-audio-player">
+                        <div className="audio-player-meta">
+                          <Mic size={12} color="#38bdf8" />
+                          <span>Voice Note ({msg.audio.durationFormatted})</span>
+                        </div>
+                        <audio controls src={msg.audio.url} className="chat-audio-element" />
+                      </div>
+                    )}
+                  </div>
+                  {activeSessionId && idx > 0 && (
+                    <button
+                      type="button"
+                      className="btn-revert-turn"
+                      onClick={() => handleRevertTurn(msg.stepIndex || 0)}
+                      title="Revert conversation back to this turn"
+                    >
+                      <RotateCcw size={10} /> Revert
+                    </button>
+                  )}
+                </div>
               ) : (
                 <div className="message-assistant">
                   {/* Step-based execution stream (Thinking, Tools, and Content in chronological order) */}
@@ -1529,7 +2089,30 @@ export default function App() {
         </div>
 
         {/* Prompt Input Box */}
-        <div className="input-area">
+        <div className="input-area" style={{ position: 'relative' }}>
+          {/* Slash Command Autocomplete Popover */}
+          {slashMenuOpen && filteredSlashCommands.length > 0 && (
+            <div className="slash-autocomplete-popover">
+              <div className="slash-autocomplete-header">
+                Slash Commands & Skills ({filteredSlashCommands.length})
+              </div>
+              {filteredSlashCommands.map((cmd, idx) => (
+                <div
+                  key={cmd.name}
+                  className={`slash-command-item ${idx === slashSelectedIndex ? 'active' : ''}`}
+                  onClick={() => applySlashCommand(cmd.name)}
+                  onMouseEnter={() => setSlashSelectedIndex(idx)}
+                >
+                  <div className="slash-command-left">
+                    <span className="slash-command-name">/{cmd.name}</span>
+                    <span className="slash-command-desc">{cmd.description}</span>
+                  </div>
+                  <span className="slash-command-tag">{cmd.type || 'command'}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
           {runningTasksCount > 0 && (
             <div className="running-tasks-banner" onClick={() => setShowTasksModal(true)}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -1543,32 +2126,124 @@ export default function App() {
               </div>
             </div>
           )}
+
+          {isRecording && (
+            <div className="voice-recording-banner">
+              <div className="voice-recording-left">
+                <span className="voice-recording-dot"></span>
+                <span className="voice-recording-label">
+                  Recording ({Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')})
+                </span>
+                <div className="voice-wave-container">
+                  <span className="voice-wave-bar"></span>
+                  <span className="voice-wave-bar"></span>
+                  <span className="voice-wave-bar"></span>
+                  <span className="voice-wave-bar"></span>
+                  <span className="voice-wave-bar"></span>
+                </div>
+                <span className="voice-recording-hint">Speak now — click Stop to review or Send Now to submit</span>
+              </div>
+              <div className="voice-recording-actions">
+                <button
+                  type="button"
+                  className="btn-cancel-voice-recording"
+                  onClick={cancelAudioRecording}
+                  title="Discard recording"
+                >
+                  <X size={12} /> Cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn-stop-voice-recording"
+                  onClick={stopAudioRecording}
+                  title="Stop recording and keep voice note attached"
+                >
+                  <Square size={11} fill="currentColor" /> Stop
+                </button>
+                <button
+                  type="button"
+                  className="btn-send-voice-recording"
+                  onClick={handleVoiceSend}
+                  title="Stop and send prompt immediately"
+                >
+                  <Send size={12} /> Send Now
+                </button>
+              </div>
+            </div>
+          )}
+
+          {attachedAudio && (
+            <div className="attached-audio-card">
+              <div className="attached-audio-left">
+                <div className="attached-audio-icon-box">
+                  <Mic size={14} color="#38bdf8" />
+                </div>
+                <div className="attached-audio-details">
+                  <div className="attached-audio-title-row">
+                    <span className="attached-audio-badge">Voice Note</span>
+                    <span className="attached-audio-time">{attachedAudio.durationFormatted}</span>
+                  </div>
+                  {attachedAudio.transcription && (
+                    <div className="attached-audio-transcript">
+                      "{attachedAudio.transcription}"
+                    </div>
+                  )}
+                </div>
+              </div>
+              <audio controls src={attachedAudio.url} className="attached-audio-player" />
+              <button
+                type="button"
+                className="btn-remove-audio"
+                onClick={() => setAttachedAudio(null)}
+                title="Discard attached voice note"
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
+          )}
+
           <form className="input-box-wrapper" onSubmit={handleSendMessage}>
             <textarea
               className="chat-input"
-              placeholder="Send prompt to agy daemon directly from browser..."
+              placeholder={isRecording ? "Listening to your voice..." : (attachedAudio ? "Add optional instructions to your voice note..." : "Type / for commands & skills, or prompt agy daemon directly...")}
               value={inputPrompt}
-              onChange={(e) => setInputPrompt(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSendMessage();
-                }
-              }}
+              onChange={handlePromptChange}
+              onKeyDown={handlePromptKeyDown}
             />
-            {isGenerating ? (
-              <button type="button" className="stop-button" onClick={handleStop}>
-                <Square size={14} /> Stop
-              </button>
-            ) : (
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
               <button
-                type="submit"
-                className="send-button"
-                disabled={!inputPrompt.trim() || !connected}
+                type="button"
+                className={`btn-mic ${isRecording ? 'recording' : ''}`}
+                onClick={toggleRecording}
+                title={isRecording ? 'Stop Voice Recording' : 'Record Voice Note'}
               >
-                <Send size={14} /> Send
+                {isRecording ? (
+                  <>
+                    <Square size={11} fill="currentColor" />
+                    <span style={{ fontSize: '11px', fontWeight: 600, marginLeft: '4px' }}>
+                      {Math.floor(recordingTime / 60)}:{(recordingTime % 60).toString().padStart(2, '0')}
+                    </span>
+                  </>
+                ) : (
+                  <Mic size={15} />
+                )}
               </button>
-            )}
+
+              {isGenerating ? (
+                <button type="button" className="stop-button" onClick={handleStop}>
+                  <Square size={14} /> Stop
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  className="send-button"
+                  disabled={(!inputPrompt.trim() && !attachedAudio && !isRecording) || isGenerating}
+                >
+                  <Send size={14} /> Send
+                </button>
+              )}
+            </div>
           </form>
         </div>
       </div>

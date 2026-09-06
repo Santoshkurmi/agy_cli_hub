@@ -716,7 +716,9 @@ export class AntigravityBrowserClient {
     modelEnum,
     thinkingBudget = 8192,
     autoExecutionPolicy = 'CASCADE_COMMANDS_AUTO_EXECUTION_EAGER',
-    autoExecute
+    autoExecute,
+    planningMode,
+    media = []
   }) {
     if (!this.csrfToken) await this.initCsrfToken();
 
@@ -731,7 +733,8 @@ export class AntigravityBrowserClient {
 
     const payload = {
       cascadeId,
-      items: [{ text }],
+      items: [{ text: text || (media && media.length > 0 ? 'Voice message' : '') }],
+      ...(media && media.length > 0 ? { media } : {}),
       cascadeConfig: {
         plannerConfig: {
           toolConfig: {
@@ -749,7 +752,8 @@ export class AntigravityBrowserClient {
           thinkingBudget: Number(thinkingBudget) || 0,
           knowledgeConfig: {},
           useAiCredits: false,
-          supportsLatexRendering: true
+          supportsLatexRendering: true,
+          ...(planningMode ? { planningMode } : {})
         },
         executorConfig: {
           useCoreDirect: true
@@ -1325,5 +1329,156 @@ export class AntigravityBrowserClient {
       })
     });
     return res.ok;
+  }
+
+  // 13. Search all past conversations & trajectories
+  async searchConversations(query) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/SearchConversations`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-codeium-csrf-token': this.csrfToken
+      },
+      body: JSON.stringify({ query: String(query || '') })
+    });
+    this.checkResponse(res);
+    const data = await res.json();
+    return data.results || [];
+  }
+
+  // 14. Fetch available slash commands (lazy-cached by caller)
+  async getSlashCommands(modelEnum = 'MODEL_PLACEHOLDER_M318') {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetSlashCommands`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-codeium-csrf-token': this.csrfToken
+      },
+      body: JSON.stringify({
+        cascadeConfig: {
+          plannerConfig: {
+            requestedModel: {
+              model: modelEnum || 'MODEL_PLACEHOLDER_M318'
+            }
+          }
+        }
+      })
+    });
+    this.checkResponse(res);
+    const data = await res.json();
+    return data.commands || [];
+  }
+
+  // 15. Fork conversation up to a given step
+  async forkConversation(sourceCascadeId, revertToStep = null) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const payload = {
+      source_cascade_id: sourceCascadeId
+    };
+    if (revertToStep !== null && revertToStep !== undefined) {
+      payload.revert_to_step = Number(revertToStep);
+    }
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/ForkConversation`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-codeium-csrf-token': this.csrfToken
+      },
+      body: JSON.stringify(payload)
+    });
+    this.checkResponse(res);
+    const data = await res.json();
+    return data.newCascadeId || null;
+  }
+
+  // 16. Revert conversation back to stepIndex
+  async revertToCascadeStep(cascadeId, stepIndex) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/RevertToCascadeStep`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-codeium-csrf-token': this.csrfToken
+      },
+      body: JSON.stringify({
+        cascade_id: cascadeId,
+        step_index: Number(stepIndex)
+      })
+    });
+    this.checkResponse(res);
+    return res.ok;
+  }
+
+  // 17. Watch live Git VCS state stream
+  async watchVersionControlState(workspaceUri, onUpdate, abortSignal) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const normalizedUri = workspaceUri
+      ? (workspaceUri.startsWith('file://') ? workspaceUri : `file://${workspaceUri}`)
+      : 'file:///home/cat/agy_cli_hub';
+
+    try {
+      const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/WatchVersionControlState`, {
+        method: 'POST',
+        headers: this.getHeaders(),
+        body: this.encodeFrame({
+          workspace_uri: normalizedUri
+        }),
+        signal: abortSignal
+      });
+      this.checkResponse(res);
+
+      await this.parseStream(res.body, (json) => {
+        if (json?.state) {
+          onUpdate(json.state);
+        }
+      });
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.warn('[VCS Watch] Stream closed:', err.message);
+      }
+    }
+  }
+
+  // 18. Delete conversation trajectory
+  async deleteCascadeTrajectory(cascadeId) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/DeleteCascadeTrajectory`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-codeium-csrf-token': this.csrfToken
+      },
+      body: JSON.stringify({
+        cascadeId
+      })
+    });
+    this.checkResponse(res);
+    return res.ok;
+  }
+
+  // 19. Transcribe audio data via daemon
+  async getTranscription(audioBase64, prompt = '') {
+    if (!this.csrfToken) await this.initCsrfToken();
+    try {
+      const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetTranscription`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-codeium-csrf-token': this.csrfToken
+        },
+        body: JSON.stringify({
+          audioData: audioBase64,
+          prompt
+        })
+      });
+      this.checkResponse(res);
+      const data = await res.json();
+      return data.transcribedText || '';
+    } catch (err) {
+      console.warn('[getTranscription] failed:', err);
+      return '';
+    }
   }
 }
