@@ -97,6 +97,8 @@ export default function App() {
   const abortControllerRef = useRef(null);  // for stop button (CancelCascadeInvocation)
   const streamControllerRef = useRef(null); // for the one persistent stream per session
   const turnStartStepRef = useRef(0);        // updated before each sendMessage
+  const isGeneratingRef = useRef(false);
+  const newSessionsNeedingTitleRef = useRef(new Set());
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -148,6 +150,11 @@ export default function App() {
       console.log('[UI] Fetching conversations list...');
       const convList = await client.listConversations();
       setConversations(convList);
+      convList.forEach(c => {
+        if (c.stepCount === 0 || (c.title && c.title.startsWith('Session ('))) {
+          newSessionsNeedingTitleRef.current.add(c.id);
+        }
+      });
       if (convList.length > 0 && !activeSessionId) {
         selectConversation(convList[0].id);
       }
@@ -178,6 +185,7 @@ export default function App() {
     try {
       const modelToUse = selectedModel || models[0]?.modelEnum || 'MODEL_PLACEHOLDER_M319';
       const cascadeId = await client.startConversation(modelToUse, finalPath, finalProjId);
+      newSessionsNeedingTitleRef.current.add(cascadeId);
       saveSessionWorkspace(cascadeId, finalPath, finalProjId);
       const newChat = {
         id: cascadeId,
@@ -216,20 +224,20 @@ export default function App() {
     const controller = new AbortController();
     streamControllerRef.current = controller;
 
-    // Only refresh the conversation list once per session (after the first response,
-    // when the daemon sets the chat title). Subsequent turns don't change the list.
-    let doneCount = 0;
-
     // Pass a getter so the stream reads the current turn boundary dynamically
     client.streamUpdates(
       sessionId,
       (update) => {
         if (update.type === 'done') {
+          const wasGenerating = isGeneratingRef.current;
+          isGeneratingRef.current = false;
           setIsGenerating(false);
-          doneCount++;
-          // Only fetch conversation list on the FIRST done (title gets assigned then).
-          // After that, the list won't change until a new session is created.
-          if (doneCount === 1) {
+
+          // Only fetch conversation list once: after the first response of a NEW chat,
+          // so its sidebar title updates from the placeholder to the model-generated title.
+          // Never call it when switching chats or on subsequent messages in existing chats.
+          if (wasGenerating && newSessionsNeedingTitleRef.current.has(sessionId)) {
+            newSessionsNeedingTitleRef.current.delete(sessionId);
             client.listConversations().then(remoteList => {
               const saved = getSavedWorkspaces();
               setConversations(prev => remoteList.map(remote => {
@@ -351,7 +359,9 @@ export default function App() {
   };
 
   const selectConversation = async (id) => {
+    if (id === activeSessionId) return;
     setActiveSessionId(id);
+    isGeneratingRef.current = false;
     setIsGenerating(false);
     turnStartStepRef.current = 0;
 
@@ -436,6 +446,7 @@ export default function App() {
     if (!targetSessionId) {
       try {
         targetSessionId = await client.startConversation(modelToUse, workspaceDir, selectedProjectId);
+        newSessionsNeedingTitleRef.current.add(targetSessionId);
         setActiveSessionId(targetSessionId);
         saveSessionWorkspace(targetSessionId, workspaceDir, selectedProjectId);
         const projObj = projects.find(p => p.id === selectedProjectId);
@@ -471,6 +482,7 @@ export default function App() {
 
     // 2. Append user message & placeholder assistant turn
     setMessages(prev => [...prev, { role: 'user', content: currentPrompt }, { role: 'assistant', steps: [] }]);
+    isGeneratingRef.current = true;
     setIsGenerating(true);
 
     try {
@@ -498,17 +510,19 @@ export default function App() {
         }
         return clone;
       });
+      isGeneratingRef.current = false;
       setIsGenerating(false);
     }
   };
 
   const handleStop = async () => {
+    isGeneratingRef.current = false;
+    setIsGenerating(false);
     if (activeSessionId) {
       await client.stop(activeSessionId);
     }
     // NOTE: Do NOT abort streamControllerRef — the persistent stream must stay alive.
     // abortControllerRef is only for stop button legacy; generation stop is done via CancelCascadeInvocation.
-    setIsGenerating(false);
   };
 
 
