@@ -1844,12 +1844,15 @@ export class AntigravityBrowserClient {
     try {
       const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetAuthStatus`, {
         method: 'POST',
-        headers: this.getHeaders(),
-        body: this.encodeFrame({})
+        headers: {
+          'Content-Type': 'application/json',
+          'x-codeium-csrf-token': this.csrfToken
+        },
+        body: JSON.stringify({})
       });
-      const chunks = [];
-      await this.parseStream(res.body, (json) => chunks.push(json));
-      return chunks[0]?.authResult || null;
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data?.authResult || null;
     } catch {
       return null;
     }
@@ -1861,12 +1864,14 @@ export class AntigravityBrowserClient {
     try {
       const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/GetLocalUserInfo`, {
         method: 'POST',
-        headers: this.getHeaders(),
-        body: this.encodeFrame({})
+        headers: {
+          'Content-Type': 'application/json',
+          'x-codeium-csrf-token': this.csrfToken
+        },
+        body: JSON.stringify({})
       });
-      const chunks = [];
-      await this.parseStream(res.body, (json) => chunks.push(json));
-      return chunks[0] || null;
+      if (!res.ok) return null;
+      return await res.json();
     } catch {
       return null;
     }
@@ -1874,19 +1879,66 @@ export class AntigravityBrowserClient {
 
   // 23. Log out the current user
   async authLogout() {
-    // Always fetch a fresh CSRF token before logout
-    await this.initCsrfToken();
-    const res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/AuthLogout`, {
+    if (!this.csrfToken) await this.initCsrfToken();
+    let res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/AuthLogout`, {
       method: 'POST',
-      headers: this.getHeaders(),
-      body: this.encodeFrame({})
+      headers: {
+        'Content-Type': 'application/json',
+        'x-codeium-csrf-token': this.csrfToken
+      },
+      body: JSON.stringify({})
     });
-    // grpc-status: 0 means success
-    const status = res.headers.get('grpc-status') || '0';
-    if (status !== '0') {
-      const msg = res.headers.get('grpc-message') || 'Logout failed';
-      throw new Error(msg);
+    if (!res.ok) {
+      // If token expired, try once more with fresh CSRF
+      await this.initCsrfToken();
+      res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/AuthLogout`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-codeium-csrf-token': this.csrfToken
+        },
+        body: JSON.stringify({})
+      });
+      if (!res.ok) {
+        throw new Error(`Logout failed with HTTP ${res.status}`);
+      }
     }
     return true;
+  }
+
+  // 24. Trigger Google OAuth login with redirect (opens browser automatically via daemon)
+  async login(options = {}) {
+    if (!this.csrfToken) await this.initCsrfToken();
+    const payload = {
+      isGcpTos: options.isGcpTos ?? false,
+      additionalScopes: options.additionalScopes ?? [],
+      enableBusinessLogin: options.enableBusinessLogin ?? false,
+      wifLoginInfo: options.wifLoginInfo ? { providerName: options.wifLoginInfo.providerName } : undefined
+    };
+    let res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/Login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-codeium-csrf-token': this.csrfToken
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      // If token expired, try once more with fresh CSRF
+      await this.initCsrfToken();
+      res = await fetch(`${this.baseUrl}/exa.language_server_pb.LanguageServerService/Login`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-codeium-csrf-token': this.csrfToken
+        },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        throw new Error(`Login failed with HTTP ${res.status}`);
+      }
+    }
+    const data = await res.json();
+    return data?.authResult || null;
   }
 }

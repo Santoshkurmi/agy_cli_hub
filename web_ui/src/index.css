@@ -1535,6 +1535,11 @@ body {
 }
 .profile-dropdown-action.logout { color: #f87171; }
 .profile-dropdown-action.login  { color: #34d399; }
+.profile-dropdown-action:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  pointer-events: none;
+}
 
 
 .model-selector-group {

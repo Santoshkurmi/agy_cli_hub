@@ -204,6 +204,7 @@ export default function App() {
   const [authStatus, setAuthStatus] = useState(null);   // { hasValidAuth, grantedScopes }
   const [userInfo, setUserInfo] = useState(null);        // { username, homeDirUri }
   const [showProfileMenu, setShowProfileMenu] = useState(false);
+  const [isAuthBusy, setIsAuthBusy] = useState(false);
   const profileMenuRef = useRef(null);
 
   // Sidebar Search States
@@ -2198,8 +2199,9 @@ export default function App() {
                       type="button"
                       id="profile-logout-btn"
                       className="profile-dropdown-action logout"
+                      disabled={isAuthBusy}
                       onClick={async () => {
-                        setShowProfileMenu(false);
+                        setIsAuthBusy(true);
                         try {
                           await client.authLogout();
                           const [authRes, userRes] = await Promise.all([
@@ -2209,24 +2211,69 @@ export default function App() {
                           setAuthStatus(authRes);
                           setUserInfo(userRes);
                           showToast('Logged out successfully.', 'success');
+                          setShowProfileMenu(false);
                         } catch (err) {
                           showToast(`Logout failed: ${err.message}`, 'error');
+                        } finally {
+                          setIsAuthBusy(false);
                         }
                       }}
                     >
-                      <X size={14} /> Log Out
+                      {isAuthBusy ? <Loader2 size={14} className="spin" /> : <X size={14} />} Log Out
                     </button>
                   ) : (
                     <button
                       type="button"
                       id="profile-login-btn"
                       className="profile-dropdown-action login"
-                      onClick={() => {
-                        setShowProfileMenu(false);
-                        showToast('To log in, run: agy login in your terminal.', 'info');
+                      disabled={isAuthBusy}
+                      onClick={async () => {
+                        setIsAuthBusy(true);
+                        showToast('Opening browser for Google Sign-In...', 'info');
+
+                        // Poll for completion in case browser finishes independently
+                        const pollTimer = setInterval(async () => {
+                          try {
+                            const auth = await client.getAuthStatus();
+                            if (auth?.hasValidAuth) {
+                              clearInterval(pollTimer);
+                              const user = await client.getLocalUserInfo();
+                              setAuthStatus(auth);
+                              setUserInfo(user);
+                              setIsAuthBusy(false);
+                              showToast('Signed in successfully!', 'success');
+                              setShowProfileMenu(false);
+                            }
+                          } catch {}
+                        }, 2000);
+
+                        const timeoutTimer = setTimeout(() => {
+                          clearInterval(pollTimer);
+                          setIsAuthBusy(false);
+                        }, 180000);
+
+                        try {
+                          const authResult = await client.login({ isGcpTos: false });
+                          clearInterval(pollTimer);
+                          clearTimeout(timeoutTimer);
+                          if (authResult?.hasValidAuth) {
+                            const [authRes, userRes] = await Promise.all([
+                              client.getAuthStatus(),
+                              client.getLocalUserInfo()
+                            ]);
+                            setAuthStatus(authRes);
+                            setUserInfo(userRes);
+                            showToast('Signed in successfully!', 'success');
+                            setShowProfileMenu(false);
+                          }
+                        } catch (err) {
+                          console.warn('[UI] Login flow notice:', err);
+                        } finally {
+                          setIsAuthBusy(false);
+                        }
                       }}
                     >
-                      <CheckCircle2 size={14} /> Log In
+                      {isAuthBusy ? <Loader2 size={14} className="spin" /> : <CheckCircle2 size={14} />} Log In
                     </button>
                   )}
                 </div>
