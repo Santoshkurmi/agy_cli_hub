@@ -1,4 +1,4 @@
-# AGENT.md: Repository Architecture & Engineering Rules
+# AGENTS.md: Repository Architecture & Engineering Rules
 
 ## 1. Directory Structure & Project Roles
 
